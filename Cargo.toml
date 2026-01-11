@@ -1,0 +1,38 @@
+[package]
+name = "walsync"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight SQLite WAL sync to S3/Tigris"
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/walsync"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# S3
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+
+# File watching
+notify = "6"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
