@@ -1,4 +1,4 @@
-.PHONY: build release test test-integration test-all clean install dev check fmt lint publish help
+.PHONY: build release test test-integration test-all clean install dev check fmt lint publish publish-pypi build-python help
 
 # Default target
 all: build
@@ -10,6 +10,10 @@ build:
 # Build release version
 release:
 	cargo build --release
+
+# Build Python wheel
+build-python:
+	maturin build --release
 
 # Run unit tests
 test:
@@ -31,10 +35,15 @@ test-verbose:
 # Clean build artifacts
 clean:
 	cargo clean
+	rm -rf target/ dist/ *.egg-info/
 
 # Install locally
 install: release
 	cargo install --path .
+
+# Install Python package locally (for development)
+install-python:
+	maturin develop
 
 # Development mode - watch and rebuild
 dev:
@@ -60,6 +69,13 @@ lint:
 publish:
 	cargo publish
 
+# Publish to PyPI
+publish-pypi:
+	maturin publish
+
+# Publish to both crates.io and PyPI
+publish-all: publish publish-pypi
+
 # Bump version (requires cargo-edit: cargo install cargo-edit)
 bump-patch:
 	cargo set-version --bump patch
@@ -74,9 +90,11 @@ help:
 	@echo "Available targets:"
 	@echo ""
 	@echo "  Build:"
-	@echo "    make build     - Build debug binary"
-	@echo "    make release   - Build release binary"
-	@echo "    make install   - Install locally"
+	@echo "    make build        - Build debug binary"
+	@echo "    make release      - Build release binary"
+	@echo "    make build-python - Build Python wheel"
+	@echo "    make install      - Install CLI locally"
+	@echo "    make install-python - Install Python package for development"
 	@echo ""
 	@echo "  Test:"
 	@echo "    make test           - Run unit tests"
@@ -85,15 +103,17 @@ help:
 	@echo "    make test-verbose   - Run tests with output"
 	@echo ""
 	@echo "  Code Quality:"
-	@echo "    make check     - Check for errors"
-	@echo "    make fmt       - Format code"
-	@echo "    make lint      - Run clippy linter"
+	@echo "    make check        - Check for errors"
+	@echo "    make fmt          - Format code"
+	@echo "    make lint         - Run clippy linter"
 	@echo ""
 	@echo "  Publish:"
-	@echo "    make publish   - Publish to crates.io"
+	@echo "    make publish      - Publish to crates.io"
+	@echo "    make publish-pypi - Publish to PyPI"
+	@echo "    make publish-all  - Publish to both"
 	@echo ""
 	@echo "  Other:"
-	@echo "    make clean     - Remove build artifacts"
-	@echo "    make dev       - Watch and rebuild"
+	@echo "    make clean        - Remove build artifacts"
+	@echo "    make dev          - Watch and rebuild"
 
 .DEFAULT_GOAL := help

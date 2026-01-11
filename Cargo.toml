@@ -1,12 +1,27 @@
 [package]
 name = "walsync"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 license = "Apache-2.0"
 repository = "https://github.com/russellromney/walsync"
 
+[lib]
+name = "walsync"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "walsync"
+path = "src/main.rs"
+
+[features]
+default = []
+python = ["pyo3"]
+
 [dependencies]
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
