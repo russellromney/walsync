@@ -13,6 +13,7 @@ Commands:
   watch     Watch SQLite databases and sync WAL changes to S3
   restore   Restore a database from S3
   list      List databases in S3 bucket
+  compact   Clean up old snapshots using retention policy
   help      Print help for a command
 ```
 
@@ -87,6 +88,12 @@ walsync watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 | `-b, --bucket <BUCKET>` | S3 bucket (required) |
 | `--snapshot-interval <SECONDS>` | Full snapshot interval in seconds (default: 3600 = 1 hour) |
 | `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
+| `--compact-after-snapshot` | Run compaction after each snapshot |
+| `--compact-interval <SECONDS>` | Compaction interval in seconds (0 = disabled) |
+| `--retain-hourly <N>` | Hourly snapshots to retain (default: 24) |
+| `--retain-daily <N>` | Daily snapshots to retain (default: 7) |
+| `--retain-weekly <N>` | Weekly snapshots to retain (default: 12) |
+| `--retain-monthly <N>` | Monthly snapshots to retain (default: 12) |
 | `-h, --help` | Print help |
 
 ### Examples
@@ -107,6 +114,17 @@ walsync watch myapp.db \
 walsync watch myapp.db \
   --bucket my-backups \
   --endpoint https://fly.storage.tigris.dev
+
+# Auto-compact after each snapshot
+walsync watch myapp.db \
+  --bucket my-backups \
+  --compact-after-snapshot
+
+# Periodic compaction every hour
+walsync watch myapp.db \
+  --bucket my-backups \
+  --compact-interval 3600 \
+  --retain-hourly 48
 ```
 
 ### Output
@@ -203,6 +221,95 @@ Restoring myapp.db from s3://my-backups/...
   Applying WAL segments... done (47 segments)
   Verifying checksum... ✓ a3f2b9c8d4e5f6a7...
 ✓ Restored to restored.db
+```
+
+---
+
+## compact
+
+Clean up old snapshots using retention policy (Grandfather/Father/Son rotation).
+
+```bash
+walsync compact [OPTIONS] --bucket <BUCKET> <NAME>
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<NAME>` | Database name as stored in S3 |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-b, --bucket <BUCKET>` | S3 bucket (required) |
+| `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
+| `--hourly <N>` | Hourly snapshots to keep (default: 24) |
+| `--daily <N>` | Daily snapshots to keep (default: 7) |
+| `--weekly <N>` | Weekly snapshots to keep (default: 12) |
+| `--monthly <N>` | Monthly snapshots to keep (default: 12) |
+| `--force` | Actually delete files (default: dry-run only) |
+| `-h, --help` | Print help |
+
+### Retention Policy
+
+Walsync uses Grandfather/Father/Son (GFS) rotation:
+
+| Tier | Default | Description |
+|------|---------|-------------|
+| Hourly | 24 | Snapshots from last 24 hours |
+| Daily | 7 | One per day for last week |
+| Weekly | 12 | One per week for last 12 weeks |
+| Monthly | 12 | One per month beyond 12 weeks |
+
+**Safety guarantees:**
+- Always keeps the latest snapshot
+- Minimum 2 snapshots retained
+- Dry-run by default (`--force` required to delete)
+
+### Examples
+
+```bash
+# Dry-run: preview what would be deleted
+walsync compact myapp.db --bucket my-backups
+
+# Actually delete old snapshots
+walsync compact myapp.db --bucket my-backups --force
+
+# Keep more hourly snapshots
+walsync compact myapp.db \
+  --bucket my-backups \
+  --hourly 48 \
+  --force
+
+# Aggressive retention (fewer snapshots)
+walsync compact myapp.db \
+  --bucket my-backups \
+  --hourly 6 \
+  --daily 3 \
+  --weekly 4 \
+  --monthly 3 \
+  --force
+```
+
+### Output
+
+```
+Compaction plan for 'myapp.db':
+  Keep: 45 snapshots, Delete: 55 snapshots, Free: 127.50 MB
+
+Keeping 45 snapshots:
+  00000001-00000100.ltx (TXID: 100, 2 hours ago)
+  00000001-00000095.ltx (TXID: 95, 5 hours ago)
+  ...
+
+Deleting 55 snapshots:
+  00000001-00000042.ltx (TXID: 42, 3 months ago)
+  00000001-00000038.ltx (TXID: 38, 4 months ago)
+  ...
+
+Dry-run mode: no files deleted. Use --force to actually delete.
 ```
 
 ---
