@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use config::{Config, ResolvedDbConfig, RetentionConfig, SyncConfig};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -172,6 +173,24 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Run as a read replica, polling S3 for changes
+    Replicate {
+        /// Source S3 location (e.g., "s3://bucket/mydb")
+        source: String,
+
+        /// Local database path for the replica
+        #[arg(long)]
+        local: PathBuf,
+
+        /// Poll interval (e.g., "5s", "1m", "30s")
+        #[arg(long, default_value = "5s")]
+        interval: String,
+
+        /// S3 endpoint URL
+        #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
+        endpoint: Option<String>,
+    },
 }
 
 /// CLI arguments for Watch command
@@ -332,6 +351,41 @@ fn merge_cli_retention_overrides(base: &RetentionConfig, cli: &WatchArgs) -> Ret
     }
 }
 
+/// Parse duration string like "5s", "1m", "30s", "2h"
+fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("Empty duration string"));
+    }
+
+    let (num_str, unit) = if s.ends_with("ms") {
+        (&s[..s.len() - 2], "ms")
+    } else if s.ends_with('s') {
+        (&s[..s.len() - 1], "s")
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], "m")
+    } else if s.ends_with('h') {
+        (&s[..s.len() - 1], "h")
+    } else {
+        return Err(anyhow!(
+            "Invalid duration '{}'. Use format like '5s', '1m', '2h'",
+            s
+        ));
+    };
+
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| anyhow!("Invalid number in duration: {}", num_str))?;
+
+    match unit {
+        "ms" => Ok(Duration::from_millis(num)),
+        "s" => Ok(Duration::from_secs(num)),
+        "m" => Ok(Duration::from_secs(num * 60)),
+        "h" => Ok(Duration::from_secs(num * 3600)),
+        _ => unreachable!(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -441,6 +495,16 @@ async fn main() -> Result<()> {
         } => {
             let policy = retention::RetentionPolicy::new(hourly, daily, weekly, monthly);
             sync::compact(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
+        }
+
+        Commands::Replicate {
+            source,
+            local,
+            interval,
+            endpoint,
+        } => {
+            let duration = parse_duration(&interval)?;
+            sync::replicate(&source, &local, duration, endpoint.as_deref()).await?;
         }
     }
 

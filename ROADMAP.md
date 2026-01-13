@@ -37,7 +37,8 @@ walsync watch <db>... [--config file]   # Watch and sync
 walsync snapshot <db>                    # Immediate snapshot
 walsync restore <name> -o <output>       # Restore database
 walsync list                             # List backups
-walsync compact <name> -b <bucket>       # Clean up old snapshots (NEW)
+walsync compact <name> -b <bucket>       # Clean up old snapshots
+walsync replicate <source> --local <db>  # Poll-based read replica (NEW)
 walsync explain [--config file]          # Show trigger schedule
 ```
 
@@ -193,12 +194,15 @@ snapshot_interval = "30m"  # Per-DB override
 
 ## Post-Alpha Features
 
-### Read Replicas (Poll-based)
+### Read Replicas (Poll-based) ✅ COMPLETE
 ```bash
 walsync replicate s3://bucket/mydb --local replica.db --interval 5s
 ```
-- Polls S3 for new LTX files
-- Applies to local read-only database
+- ✅ Polls S3 for new LTX files at configurable interval
+- ✅ Auto-bootstraps from latest snapshot if local db doesn't exist
+- ✅ Applies incremental LTX files in-place (efficient page writes)
+- ✅ TXID-based tracking with `.db-replica-state` file for resume
+- ✅ Gap detection and automatic re-bootstrap when needed
 - No network required between primary/replica
 
 ### Read Replicas (Push-based) - Future
@@ -275,6 +279,11 @@ s3://bucket/prefix/
   - [x] `walsync compact` command with dry-run default
   - [x] Auto-compaction in watch mode (--compact-after-snapshot, --compact-interval)
   - [x] Batch S3 delete operations
+- [x] **Poll-based Read Replicas**
+  - [x] `walsync replicate` command with configurable poll interval
+  - [x] Auto-bootstrap from latest snapshot
+  - [x] In-place incremental LTX apply
+  - [x] TXID tracking with resume capability
 - [x] WAL sync to S3/Tigris as incremental LTX files
 - [x] SHA256 checksums in S3 metadata
 - [x] Multi-database support (single process)

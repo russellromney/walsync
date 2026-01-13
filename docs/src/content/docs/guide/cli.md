@@ -9,12 +9,13 @@ description: Complete CLI reference with options and examples
 walsync <COMMAND>
 
 Commands:
-  snapshot  Take an immediate snapshot
-  watch     Watch SQLite databases and sync WAL changes to S3
-  restore   Restore a database from S3
-  list      List databases in S3 bucket
-  compact   Clean up old snapshots using retention policy
-  help      Print help for a command
+  snapshot   Take an immediate snapshot
+  watch      Watch SQLite databases and sync WAL changes to S3
+  restore    Restore a database from S3
+  list       List databases in S3 bucket
+  compact    Clean up old snapshots using retention policy
+  replicate  Run as a read replica, polling S3 for changes
+  help       Print help for a command
 ```
 
 ---
@@ -311,6 +312,90 @@ Deleting 55 snapshots:
 
 Dry-run mode: no files deleted. Use --force to actually delete.
 ```
+
+---
+
+## replicate
+
+Run as a read replica, polling S3 for new LTX files and applying them locally.
+
+```bash
+walsync replicate [OPTIONS] --local <LOCAL> <SOURCE>
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<SOURCE>` | S3 location of the database (e.g., `s3://bucket/mydb`) |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--local <LOCAL>` | Local database path for the replica (required) |
+| `--interval <INTERVAL>` | Poll interval (default: `5s`). Supports `s`, `m`, `h` suffixes |
+| `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
+| `-h, --help` | Print help |
+
+### How It Works
+
+1. **Bootstrap**: If the local database doesn't exist, downloads the latest snapshot from S3
+2. **Poll**: Checks S3 for new LTX files at the specified interval
+3. **Apply**: Downloads and applies incremental LTX files in-place (only changed pages)
+4. **Track**: Stores current TXID in `.db-replica-state` file for resume capability
+
+### Examples
+
+```bash
+# Basic read replica with 5-second polling
+walsync replicate s3://my-bucket/mydb --local replica.db --interval 5s
+
+# Replica with custom endpoint (Tigris)
+walsync replicate s3://my-bucket/mydb \
+  --local /var/lib/app/replica.db \
+  --interval 30s \
+  --endpoint https://fly.storage.tigris.dev
+
+# Using environment variable for endpoint
+export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
+walsync replicate s3://my-bucket/prefix/mydb --local replica.db
+
+# Fast polling for near-real-time replication
+walsync replicate s3://my-bucket/mydb --local replica.db --interval 1s
+```
+
+### Output
+
+```
+Replicating s3://my-bucket/mydb -> replica.db
+Poll interval: 5s
+Press Ctrl+C to stop
+
+Bootstrapped from snapshot: 1024 pages, TXID 100
+[10:30:05] Applied 1 LTX file(s), now at TXID 101
+[10:30:10] Applied 2 LTX file(s), now at TXID 103
+```
+
+### State File
+
+Walsync stores replica progress in a `.db-replica-state` file alongside the database:
+
+```json
+{
+  "current_txid": 103,
+  "last_updated": "2024-01-15T10:30:10Z"
+}
+```
+
+This allows the replica to resume from where it left off after restart.
+
+### Use Cases
+
+- **Read scaling**: Offload read queries to replicas
+- **Disaster recovery**: Keep warm standby databases
+- **Analytics**: Run heavy queries against a replica without affecting production
+- **Edge caching**: Replicate databases closer to users
 
 ---
 
