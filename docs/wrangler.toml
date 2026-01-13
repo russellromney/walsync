@@ -1,0 +1,7 @@
+name = "walsync"
+type = "javascript"
+compatibility_date = "2024-01-12"
+
+# Build configuration
+build = { command = "npm run build" }
+main = "dist"
