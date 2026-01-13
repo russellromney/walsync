@@ -1,6 +1,6 @@
 [package]
 name = "walsync"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -46,6 +46,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
+glob = "0.3"
 sha2 = "0.10"
 
 # LTX format (Litestream-compatible)

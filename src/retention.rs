@@ -7,10 +7,11 @@
 //! - Monthly tier: Keep N snapshots, one per month beyond 12 weeks
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Retention policy configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionPolicy {
     /// Number of hourly snapshots to keep (default: 24)
     pub hourly: usize,

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use crate::config::{ResolvedDbConfig, SyncConfig};
 use crate::ltx;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
@@ -176,7 +177,7 @@ pub async fn watch(
     // Initial sync of any existing WAL data
     for state in db_states.values_mut() {
         if state.wal_path.exists() {
-            sync_wal(&client, &bucket_name, &prefix, state).await?;
+            let _ = sync_wal(&client, &bucket_name, &prefix, state).await?;
         }
     }
 
@@ -220,8 +221,9 @@ pub async fn watch(
                 // Find the corresponding database
                 let db_path = wal_path.with_extension("db");
                 if let Some(state) = db_states.get_mut(&db_path) {
-                    if let Err(e) = sync_wal(&client, &bucket_name, &prefix, state).await {
-                        tracing::error!("Failed to sync WAL for {}: {}", state.name, e);
+                    match sync_wal(&client, &bucket_name, &prefix, state).await {
+                        Ok(_frame_count) => {}
+                        Err(e) => tracing::error!("Failed to sync WAL for {}: {}", state.name, e),
                     }
                 }
             }
@@ -248,6 +250,370 @@ pub async fn watch(
 
             // Compaction timer (if enabled)
             _ = compact_timer.tick(), if compact_interval > 0 => {
+                if let Some(ref policy) = compact_policy {
+                    for state in db_states.values() {
+                        if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
+                            tracing::error!("Failed to compact {}: {}", state.name, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// State for sync trigger tracking
+struct TriggerState {
+    /// WAL frames synced since last snapshot
+    frames_since_snapshot: u64,
+    /// When the first change was detected (for max_interval)
+    first_change_time: Option<std::time::Instant>,
+    /// When the last WAL activity occurred (for on_idle)
+    last_wal_activity: Option<std::time::Instant>,
+}
+
+impl Default for TriggerState {
+    fn default() -> Self {
+        Self {
+            frames_since_snapshot: 0,
+            first_change_time: None,
+            last_wal_activity: None,
+        }
+    }
+}
+
+/// Watch databases with config-based settings and sync triggers
+pub async fn watch_with_config(
+    databases: Vec<ResolvedDbConfig>,
+    bucket: &str,
+    endpoint: Option<&str>,
+    global_sync: SyncConfig,
+    compact_policy: Option<RetentionPolicy>,
+) -> Result<()> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = Arc::new(create_client(endpoint).await?);
+
+    // Initialize state for each database
+    let mut db_states: HashMap<PathBuf, DbState> = HashMap::new();
+    let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
+    let mut sync_configs: HashMap<PathBuf, SyncConfig> = HashMap::new();
+
+    for db_config in &databases {
+        let db_path = &db_config.path;
+        if !db_path.exists() {
+            return Err(anyhow!("Database not found: {}", db_path.display()));
+        }
+
+        let name = db_config.prefix.clone();
+        let wal_path = db_path.with_extension("db-wal");
+
+        // Check for existing state in S3 (manifest.json)
+        let manifest_key = format!("{}{}/manifest.json", prefix, name);
+        let (wal_offset, wal_generation, current_txid) =
+            match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
+                Ok(data) => {
+                    let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
+                    // For backwards compat, also check old state.json
+                    let state_key = format!("{}{}/state.json", prefix, name);
+                    let (offset, gen) =
+                        match s3::download_bytes(&client, &bucket_name, &state_key).await {
+                            Ok(state_data) => {
+                                let state: serde_json::Value =
+                                    serde_json::from_slice(&state_data)?;
+                                (
+                                    state["wal_offset"].as_u64().unwrap_or(0),
+                                    state["wal_generation"].as_u64().unwrap_or(0),
+                                )
+                            }
+                            Err(_) => (0, 0),
+                        };
+                    (offset, gen, manifest.current_txid)
+                }
+                Err(_) => {
+                    // Try old state.json for backwards compat
+                    let state_key = format!("{}{}/state.json", prefix, name);
+                    match s3::download_bytes(&client, &bucket_name, &state_key).await {
+                        Ok(data) => {
+                            let state: serde_json::Value = serde_json::from_slice(&data)?;
+                            (
+                                state["wal_offset"].as_u64().unwrap_or(0),
+                                state["wal_generation"].as_u64().unwrap_or(0),
+                                state["current_txid"].as_u64().unwrap_or(0),
+                            )
+                        }
+                        Err(_) => (0, 0, 0),
+                    }
+                }
+            };
+
+        tracing::info!(
+            "Watching {} as '{}' (WAL offset: {}, generation: {}, TXID: {})",
+            db_path.display(),
+            name,
+            wal_offset,
+            wal_generation,
+            current_txid
+        );
+
+        db_states.insert(
+            db_path.clone(),
+            DbState {
+                name,
+                db_path: db_path.clone(),
+                wal_path,
+                wal_offset,
+                wal_generation,
+                current_txid,
+                last_snapshot: None,
+            },
+        );
+
+        trigger_states.insert(db_path.clone(), TriggerState::default());
+        sync_configs.insert(db_path.clone(), db_config.sync.clone());
+    }
+
+    // Set up file watcher
+    let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            for path in event.paths {
+                // Only care about WAL files
+                if path.extension().map(|e| e == "db-wal").unwrap_or(false) {
+                    let _ = tx.blocking_send(path);
+                }
+            }
+        }
+    })?;
+
+    // Watch parent directories of all databases
+    let mut watched_dirs = std::collections::HashSet::new();
+    for db_config in &databases {
+        if let Some(parent) = db_config.path.parent() {
+            if watched_dirs.insert(parent.to_path_buf()) {
+                watcher.watch(parent, RecursiveMode::NonRecursive)?;
+                tracing::debug!("Watching directory: {}", parent.display());
+            }
+        }
+    }
+
+    // Initial sync of any existing WAL data
+    for (db_path, state) in db_states.iter_mut() {
+        if state.wal_path.exists() {
+            let frame_count = sync_wal(&client, &bucket_name, &prefix, state).await?;
+            if frame_count > 0 {
+                if let Some(trigger) = trigger_states.get_mut(db_path) {
+                    trigger.frames_since_snapshot += frame_count;
+                    trigger.last_wal_activity = Some(std::time::Instant::now());
+                    if trigger.first_change_time.is_none() {
+                        trigger.first_change_time = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+    }
+
+    // Take initial snapshots if on_startup is enabled
+    for (db_path, state) in db_states.iter_mut() {
+        let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
+        if sync_config.on_startup {
+            take_snapshot(&client, &bucket_name, &prefix, state).await?;
+            if let Some(trigger) = trigger_states.get_mut(db_path) {
+                trigger.frames_since_snapshot = 0;
+                trigger.first_change_time = None;
+            }
+
+            // Run compaction after initial snapshot if enabled
+            if sync_config.compact_after_snapshot {
+                if let Some(ref policy) = compact_policy {
+                    if let Err(e) =
+                        run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await
+                    {
+                        tracing::error!("Failed to compact {}: {}", state.name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Set up periodic snapshot timer based on global config
+    let snapshot_interval = Duration::from_secs(global_sync.snapshot_interval);
+    let mut snapshot_timer = tokio::time::interval(snapshot_interval);
+
+    // Set up compaction timer
+    let compact_interval_duration = if global_sync.compact_interval > 0 {
+        Duration::from_secs(global_sync.compact_interval)
+    } else {
+        Duration::from_secs(u64::MAX)
+    };
+    let mut compact_timer = tokio::time::interval(compact_interval_duration);
+    compact_timer.tick().await; // Skip first tick
+
+    // Set up trigger check interval (1 second granularity)
+    let mut trigger_timer = tokio::time::interval(Duration::from_secs(1));
+
+    // Log startup info with sync trigger settings
+    let triggers_enabled = global_sync.max_changes > 0
+        || global_sync.max_interval > 0
+        || global_sync.on_idle > 0;
+
+    if triggers_enabled {
+        tracing::info!(
+            "walsync running (snapshot interval: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s)",
+            global_sync.snapshot_interval,
+            global_sync.max_changes,
+            global_sync.max_interval,
+            global_sync.on_idle
+        );
+    } else {
+        tracing::info!(
+            "walsync running (snapshot interval: {}s)",
+            global_sync.snapshot_interval
+        );
+    }
+
+    loop {
+        tokio::select! {
+            // WAL file changed
+            Some(wal_path) = rx.recv() => {
+                let db_path = wal_path.with_extension("db");
+                if let Some(state) = db_states.get_mut(&db_path) {
+                    let sync_config = sync_configs.get(&db_path).unwrap_or(&global_sync);
+
+                    match sync_wal(&client, &bucket_name, &prefix, state).await {
+                        Ok(frame_count) if frame_count > 0 => {
+                            if let Some(trigger) = trigger_states.get_mut(&db_path) {
+                                trigger.frames_since_snapshot += frame_count;
+                                trigger.last_wal_activity = Some(std::time::Instant::now());
+                                if trigger.first_change_time.is_none() {
+                                    trigger.first_change_time = Some(std::time::Instant::now());
+                                }
+
+                                // Check max_changes trigger
+                                if sync_config.max_changes > 0
+                                    && trigger.frames_since_snapshot >= sync_config.max_changes
+                                {
+                                    tracing::info!(
+                                        "{}: max_changes trigger ({} frames)",
+                                        state.name,
+                                        trigger.frames_since_snapshot
+                                    );
+                                    if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                                        tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                                    } else {
+                                        trigger.frames_since_snapshot = 0;
+                                        trigger.first_change_time = None;
+
+                                        if sync_config.compact_after_snapshot {
+                                            if let Some(ref policy) = compact_policy {
+                                                let _ = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("Failed to sync WAL for {}: {}", state.name, e),
+                    }
+                }
+            }
+
+            // Check sync triggers
+            _ = trigger_timer.tick() => {
+                let now = std::time::Instant::now();
+
+                for (db_path, trigger) in trigger_states.iter_mut() {
+                    let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
+
+                    // Skip if no pending changes
+                    if trigger.frames_since_snapshot == 0 {
+                        continue;
+                    }
+
+                    let state = match db_states.get_mut(db_path) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+
+                    let mut should_snapshot = false;
+                    let mut reason = "";
+
+                    // Check max_interval
+                    if sync_config.max_interval > 0 {
+                        if let Some(first_change) = trigger.first_change_time {
+                            let elapsed = now.duration_since(first_change);
+                            if elapsed.as_secs() >= sync_config.max_interval {
+                                should_snapshot = true;
+                                reason = "max_interval";
+                            }
+                        }
+                    }
+
+                    // Check on_idle
+                    if !should_snapshot && sync_config.on_idle > 0 {
+                        if let Some(last_activity) = trigger.last_wal_activity {
+                            let idle_duration = now.duration_since(last_activity);
+                            if idle_duration.as_secs() >= sync_config.on_idle {
+                                should_snapshot = true;
+                                reason = "on_idle";
+                            }
+                        }
+                    }
+
+                    if should_snapshot {
+                        tracing::info!(
+                            "{}: {} trigger ({} pending frames)",
+                            state.name,
+                            reason,
+                            trigger.frames_since_snapshot
+                        );
+
+                        if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                            tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                        } else {
+                            trigger.frames_since_snapshot = 0;
+                            trigger.first_change_time = None;
+                            trigger.last_wal_activity = None;
+
+                            if sync_config.compact_after_snapshot {
+                                if let Some(ref policy) = compact_policy {
+                                    let _ = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Periodic snapshot timer
+            _ = snapshot_timer.tick() => {
+                for (db_path, state) in db_states.iter_mut() {
+                    if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                        tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                    } else {
+                        // Reset trigger state after scheduled snapshot
+                        if let Some(trigger) = trigger_states.get_mut(db_path) {
+                            trigger.frames_since_snapshot = 0;
+                            trigger.first_change_time = None;
+                        }
+                    }
+                }
+
+                // Run compaction after snapshots if enabled
+                if global_sync.compact_after_snapshot {
+                    if let Some(ref policy) = compact_policy {
+                        for state in db_states.values() {
+                            if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
+                                tracing::error!("Failed to compact {}: {}", state.name, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compaction timer (if enabled)
+            _ = compact_timer.tick(), if global_sync.compact_interval > 0 => {
                 if let Some(ref policy) = compact_policy {
                     for state in db_states.values() {
                         if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
@@ -354,15 +720,16 @@ async fn run_compaction(
 /// - LTX incremental files require pre_apply_checksum chaining
 /// - Snapshots as LTX provide the main restore capability
 /// - Raw WAL segments can be replayed for point-in-time recovery
+/// Sync WAL changes and return the number of frames synced
 async fn sync_wal(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     state: &mut DbState,
-) -> Result<()> {
+) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(()), // No WAL file
+        None => return Ok(0), // No WAL file
     };
 
     // Check if WAL was reset (checkpoint happened)
@@ -379,7 +746,7 @@ async fn sync_wal(
         wal::read_frames_from(&state.wal_path, header.page_size, state.wal_offset).await?;
 
     if frame_count == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
     // Upload raw WAL segment
@@ -407,7 +774,7 @@ async fn sync_wal(
     // Save state
     save_state(client, bucket, prefix, state).await?;
 
-    Ok(())
+    Ok(frame_count as u64)
 }
 
 /// Take a full database snapshot as LTX

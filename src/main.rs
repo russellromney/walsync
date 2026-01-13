@@ -1,11 +1,13 @@
+mod config;
 mod ltx;
 mod retention;
-mod sync;
 mod s3;
+mod sync;
 mod wal;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use config::{Config, ResolvedDbConfig, RetentionConfig, SyncConfig};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -13,6 +15,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "walsync")]
 #[command(about = "Lightweight SQLite WAL sync to S3/Tigris")]
 struct Cli {
+    /// Config file path (checks ./walsync.toml if not specified)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -21,45 +27,60 @@ struct Cli {
 enum Commands {
     /// Watch SQLite databases and sync WAL changes to S3
     Watch {
-        /// Database files to watch
-        #[arg(required = true)]
+        /// Database files to watch (can be omitted if config file specifies databases)
         databases: Vec<PathBuf>,
 
         /// S3 bucket (e.g., "s3://my-bucket/prefix")
         #[arg(short, long)]
-        bucket: String,
+        bucket: Option<String>,
 
-        /// Snapshot interval in seconds (default: 3600 = 1 hour)
-        #[arg(long, default_value = "3600")]
-        snapshot_interval: u64,
+        /// Snapshot interval in seconds
+        #[arg(long)]
+        snapshot_interval: Option<u64>,
 
         /// S3 endpoint URL (for Tigris/MinIO/etc)
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
+
+        /// Take snapshot after N WAL frames (0 = disabled)
+        #[arg(long)]
+        max_changes: Option<u64>,
+
+        /// Maximum seconds between snapshots when changes detected
+        #[arg(long)]
+        max_interval: Option<u64>,
+
+        /// Take snapshot after N seconds of no WAL activity (0 = disabled)
+        #[arg(long)]
+        on_idle: Option<u64>,
+
+        /// Take snapshot immediately on watch start
+        #[arg(long)]
+        on_startup: Option<bool>,
 
         /// Run compaction after each snapshot
         #[arg(long)]
         compact_after_snapshot: bool,
 
         /// Compaction interval in seconds (0 = disabled)
-        #[arg(long, default_value = "0")]
-        compact_interval: u64,
+        #[arg(long)]
+        compact_interval: Option<u64>,
 
-        /// Number of hourly snapshots to retain (default: 24)
-        #[arg(long, default_value = "24")]
-        retain_hourly: usize,
+        /// Number of hourly snapshots to retain
+        #[arg(long)]
+        retain_hourly: Option<usize>,
 
-        /// Number of daily snapshots to retain (default: 7)
-        #[arg(long, default_value = "7")]
-        retain_daily: usize,
+        /// Number of daily snapshots to retain
+        #[arg(long)]
+        retain_daily: Option<usize>,
 
-        /// Number of weekly snapshots to retain (default: 12)
-        #[arg(long, default_value = "12")]
-        retain_weekly: usize,
+        /// Number of weekly snapshots to retain
+        #[arg(long)]
+        retain_weekly: Option<usize>,
 
-        /// Number of monthly snapshots to retain (default: 12)
-        #[arg(long, default_value = "12")]
-        retain_monthly: usize,
+        /// Number of monthly snapshots to retain
+        #[arg(long)]
+        retain_monthly: Option<usize>,
     },
 
     /// Restore a database from S3
@@ -144,6 +165,162 @@ enum Commands {
     },
 }
 
+/// CLI arguments for Watch command
+struct WatchArgs {
+    databases: Vec<PathBuf>,
+    bucket: Option<String>,
+    snapshot_interval: Option<u64>,
+    endpoint: Option<String>,
+    max_changes: Option<u64>,
+    max_interval: Option<u64>,
+    on_idle: Option<u64>,
+    on_startup: Option<bool>,
+    compact_after_snapshot: bool,
+    compact_interval: Option<u64>,
+    retain_hourly: Option<usize>,
+    retain_daily: Option<usize>,
+    retain_weekly: Option<usize>,
+    retain_monthly: Option<usize>,
+}
+
+/// Resolve watch configuration by merging config file with CLI args
+fn resolve_watch_config(
+    config: &Option<Config>,
+    cli: &WatchArgs,
+) -> Result<(Vec<ResolvedDbConfig>, String, Option<String>, SyncConfig, RetentionConfig)> {
+    match config {
+        Some(cfg) => {
+            // Start with config file values, CLI overrides
+            let bucket = cli
+                .bucket
+                .clone()
+                .or(cfg.s3.bucket.clone())
+                .ok_or_else(|| anyhow!("bucket required (via --bucket or config file)"))?;
+
+            let endpoint = cli.endpoint.clone().or(cfg.s3.endpoint.clone());
+
+            // If CLI specifies databases, use those; otherwise use config
+            let resolved_dbs = if !cli.databases.is_empty() {
+                // CLI databases - use global config settings with CLI overrides
+                let sync = merge_cli_sync_overrides(&cfg.sync, cli);
+                let retention = merge_cli_retention_overrides(&cfg.retention, cli);
+
+                cli.databases
+                    .iter()
+                    .map(|p| ResolvedDbConfig {
+                        path: p.clone(),
+                        prefix: p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("db")
+                            .to_string(),
+                        sync: sync.clone(),
+                        retention: retention.clone(),
+                    })
+                    .collect()
+            } else {
+                // Use databases from config file
+                let mut dbs = cfg.resolve_databases()?;
+                if dbs.is_empty() {
+                    return Err(anyhow!(
+                        "No databases specified (provide paths or configure in config file)"
+                    ));
+                }
+
+                // Apply CLI overrides to each database's config
+                for db in &mut dbs {
+                    db.sync = merge_cli_sync_overrides(&db.sync, cli);
+                    db.retention = merge_cli_retention_overrides(&db.retention, cli);
+                }
+                dbs
+            };
+
+            // For global sync/retention, merge CLI overrides with config
+            let sync = merge_cli_sync_overrides(&cfg.sync, cli);
+            let retention = merge_cli_retention_overrides(&cfg.retention, cli);
+
+            Ok((resolved_dbs, bucket, endpoint, sync, retention))
+        }
+        None => {
+            // No config file - require CLI args
+            let bucket = cli
+                .bucket
+                .clone()
+                .ok_or_else(|| anyhow!("--bucket is required when no config file is present"))?;
+
+            if cli.databases.is_empty() {
+                return Err(anyhow!(
+                    "At least one database path required when no config file is present"
+                ));
+            }
+
+            // Build config from CLI with defaults
+            let sync = SyncConfig {
+                snapshot_interval: cli.snapshot_interval.unwrap_or(3600),
+                max_changes: cli.max_changes.unwrap_or(0),
+                max_interval: cli.max_interval.unwrap_or(0),
+                on_idle: cli.on_idle.unwrap_or(0),
+                on_startup: cli.on_startup.unwrap_or(true),
+                compact_after_snapshot: cli.compact_after_snapshot,
+                compact_interval: cli.compact_interval.unwrap_or(0),
+            };
+
+            let retention = RetentionConfig {
+                hourly: cli.retain_hourly.unwrap_or(24),
+                daily: cli.retain_daily.unwrap_or(7),
+                weekly: cli.retain_weekly.unwrap_or(12),
+                monthly: cli.retain_monthly.unwrap_or(12),
+            };
+
+            let resolved_dbs = cli
+                .databases
+                .iter()
+                .map(|p| ResolvedDbConfig {
+                    path: p.clone(),
+                    prefix: p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("db")
+                        .to_string(),
+                    sync: sync.clone(),
+                    retention: retention.clone(),
+                })
+                .collect();
+
+            Ok((
+                resolved_dbs,
+                bucket,
+                cli.endpoint.clone(),
+                sync,
+                retention,
+            ))
+        }
+    }
+}
+
+/// Merge CLI sync overrides with base config
+fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
+    SyncConfig {
+        snapshot_interval: cli.snapshot_interval.unwrap_or(base.snapshot_interval),
+        max_changes: cli.max_changes.unwrap_or(base.max_changes),
+        max_interval: cli.max_interval.unwrap_or(base.max_interval),
+        on_idle: cli.on_idle.unwrap_or(base.on_idle),
+        on_startup: cli.on_startup.unwrap_or(base.on_startup),
+        compact_after_snapshot: cli.compact_after_snapshot || base.compact_after_snapshot,
+        compact_interval: cli.compact_interval.unwrap_or(base.compact_interval),
+    }
+}
+
+/// Merge CLI retention overrides with base config
+fn merge_cli_retention_overrides(base: &RetentionConfig, cli: &WatchArgs) -> RetentionConfig {
+    RetentionConfig {
+        hourly: cli.retain_hourly.unwrap_or(base.hourly),
+        daily: cli.retain_daily.unwrap_or(base.daily),
+        weekly: cli.retain_weekly.unwrap_or(base.weekly),
+        monthly: cli.retain_monthly.unwrap_or(base.monthly),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -155,12 +332,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Load config file (optional)
+    let config = Config::load(cli.config.as_deref())?;
+
     match cli.command {
         Commands::Watch {
             databases,
             bucket,
             snapshot_interval,
             endpoint,
+            max_changes,
+            max_interval,
+            on_idle,
+            on_startup,
             compact_after_snapshot,
             compact_interval,
             retain_hourly,
@@ -168,23 +352,43 @@ async fn main() -> Result<()> {
             retain_weekly,
             retain_monthly,
         } => {
-            let compact_policy = if compact_after_snapshot || compact_interval > 0 {
-                Some(retention::RetentionPolicy::new(
-                    retain_hourly,
-                    retain_daily,
-                    retain_weekly,
-                    retain_monthly,
-                ))
-            } else {
-                None
-            };
-            sync::watch(
+            let watch_args = WatchArgs {
                 databases,
-                &bucket,
+                bucket,
                 snapshot_interval,
-                endpoint.as_deref(),
+                endpoint,
+                max_changes,
+                max_interval,
+                on_idle,
+                on_startup,
                 compact_after_snapshot,
                 compact_interval,
+                retain_hourly,
+                retain_daily,
+                retain_weekly,
+                retain_monthly,
+            };
+
+            let (resolved_dbs, bucket, endpoint, sync_config, retention_config) =
+                resolve_watch_config(&config, &watch_args)?;
+
+            let compact_policy =
+                if sync_config.compact_after_snapshot || sync_config.compact_interval > 0 {
+                    Some(retention::RetentionPolicy::new(
+                        retention_config.hourly,
+                        retention_config.daily,
+                        retention_config.weekly,
+                        retention_config.monthly,
+                    ))
+                } else {
+                    None
+                };
+
+            sync::watch_with_config(
+                resolved_dbs,
+                &bucket,
+                endpoint.as_deref(),
+                sync_config,
                 compact_policy,
             )
             .await?;

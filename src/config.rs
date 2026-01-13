@@ -1,0 +1,486 @@
+//! Configuration file support for walsync.
+//!
+//! Loads walsync.toml from current directory with CLI override support.
+
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// Root configuration structure
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// S3/storage configuration
+    #[serde(default)]
+    pub s3: S3Config,
+
+    /// Global sync trigger settings
+    #[serde(default)]
+    pub sync: SyncConfig,
+
+    /// Global retention policy
+    #[serde(default)]
+    pub retention: RetentionConfig,
+
+    /// Database-specific configurations
+    #[serde(default)]
+    pub databases: Vec<DatabaseConfig>,
+}
+
+/// S3 storage configuration
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct S3Config {
+    /// S3 bucket URL (e.g., "s3://backups/prod")
+    pub bucket: Option<String>,
+
+    /// S3 endpoint URL (for Tigris/MinIO)
+    pub endpoint: Option<String>,
+}
+
+/// Sync trigger configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncConfig {
+    /// Snapshot interval in seconds (default: 3600)
+    #[serde(default = "default_snapshot_interval")]
+    pub snapshot_interval: u64,
+
+    /// Take snapshot after N WAL frames (0 = disabled)
+    #[serde(default)]
+    pub max_changes: u64,
+
+    /// Maximum seconds between snapshots when changes detected
+    #[serde(default)]
+    pub max_interval: u64,
+
+    /// Take snapshot after N seconds of no WAL activity (0 = disabled)
+    #[serde(default)]
+    pub on_idle: u64,
+
+    /// Take snapshot immediately on watch start
+    #[serde(default = "default_on_startup")]
+    pub on_startup: bool,
+
+    /// Run compaction after each snapshot
+    #[serde(default)]
+    pub compact_after_snapshot: bool,
+
+    /// Compaction interval in seconds (0 = disabled)
+    #[serde(default)]
+    pub compact_interval: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_interval: 3600,
+            max_changes: 0,
+            max_interval: 0,
+            on_idle: 0,
+            on_startup: true,
+            compact_after_snapshot: false,
+            compact_interval: 0,
+        }
+    }
+}
+
+fn default_snapshot_interval() -> u64 {
+    3600
+}
+fn default_on_startup() -> bool {
+    true
+}
+
+/// Retention policy configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    #[serde(default = "default_hourly")]
+    pub hourly: usize,
+    #[serde(default = "default_daily")]
+    pub daily: usize,
+    #[serde(default = "default_weekly")]
+    pub weekly: usize,
+    #[serde(default = "default_monthly")]
+    pub monthly: usize,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            hourly: 24,
+            daily: 7,
+            weekly: 12,
+            monthly: 12,
+        }
+    }
+}
+
+fn default_hourly() -> usize {
+    24
+}
+fn default_daily() -> usize {
+    7
+}
+fn default_weekly() -> usize {
+    12
+}
+fn default_monthly() -> usize {
+    12
+}
+
+/// Per-database configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// Path to database file (supports wildcards: /data/*.db)
+    pub path: String,
+
+    /// S3 prefix for this database (default: filename stem)
+    pub prefix: Option<String>,
+
+    /// Override snapshot interval for this database
+    pub snapshot_interval: Option<u64>,
+
+    /// Override max_changes for this database
+    pub max_changes: Option<u64>,
+
+    /// Override max_interval for this database
+    pub max_interval: Option<u64>,
+
+    /// Override on_idle for this database
+    pub on_idle: Option<u64>,
+
+    /// Override retention policy for this database
+    pub retention: Option<RetentionConfig>,
+}
+
+/// Resolved configuration for a single database (after merging)
+#[derive(Debug, Clone)]
+pub struct ResolvedDbConfig {
+    pub path: PathBuf,
+    pub prefix: String,
+    pub sync: SyncConfig,
+    pub retention: RetentionConfig,
+}
+
+impl Config {
+    /// Load config from file, or return None if not found.
+    ///
+    /// If `path` is Some, load from that path.
+    /// If `path` is None, check for ./walsync.toml in current directory.
+    /// Returns Ok(None) if no config file exists (backward compat).
+    pub fn load(path: Option<&Path>) -> Result<Option<Self>> {
+        let config_path = match path {
+            Some(p) => {
+                // Explicit path provided - must exist
+                if !p.exists() {
+                    return Err(anyhow!("Config file not found: {}", p.display()));
+                }
+                p.to_path_buf()
+            }
+            None => {
+                // Check for ./walsync.toml in current directory
+                let default_path = PathBuf::from("./walsync.toml");
+                if !default_path.exists() {
+                    return Ok(None);
+                }
+                default_path
+            }
+        };
+
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(|e| anyhow!("Failed to read {}: {}", config_path.display(), e))?;
+
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| anyhow!("Failed to parse {}: {}", config_path.display(), e))?;
+
+        config.validate()?;
+
+        tracing::info!("Loaded config from {}", config_path.display());
+        Ok(Some(config))
+    }
+
+    /// Validate configuration
+    fn validate(&self) -> Result<()> {
+        for (i, db) in self.databases.iter().enumerate() {
+            if db.path.is_empty() {
+                return Err(anyhow!("databases[{}].path cannot be empty", i));
+            }
+
+            // Validate retention values if overridden
+            if let Some(ref ret) = db.retention {
+                if ret.hourly == 0 && ret.daily == 0 && ret.weekly == 0 && ret.monthly == 0 {
+                    return Err(anyhow!(
+                        "databases[{}].retention: at least one tier must be > 0",
+                        i
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Expand wildcards and resolve all database configurations
+    pub fn resolve_databases(&self) -> Result<Vec<ResolvedDbConfig>> {
+        let mut resolved = Vec::new();
+
+        for db_config in &self.databases {
+            let paths = expand_glob(&db_config.path)?;
+
+            if paths.is_empty() {
+                tracing::warn!("No databases found matching: {}", db_config.path);
+                continue;
+            }
+
+            for path in paths {
+                let prefix = db_config.prefix.clone().unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                });
+
+                // Merge per-db settings with global defaults
+                let sync = self.merge_sync_config(db_config);
+                let retention = db_config
+                    .retention
+                    .clone()
+                    .unwrap_or_else(|| self.retention.clone());
+
+                resolved.push(ResolvedDbConfig {
+                    path,
+                    prefix,
+                    sync,
+                    retention,
+                });
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// Merge per-database sync overrides with global sync config
+    fn merge_sync_config(&self, db: &DatabaseConfig) -> SyncConfig {
+        let mut sync = self.sync.clone();
+
+        // Apply per-database overrides
+        if let Some(interval) = db.snapshot_interval {
+            sync.snapshot_interval = interval;
+        }
+        if let Some(v) = db.max_changes {
+            sync.max_changes = v;
+        }
+        if let Some(v) = db.max_interval {
+            sync.max_interval = v;
+        }
+        if let Some(v) = db.on_idle {
+            sync.on_idle = v;
+        }
+
+        sync
+    }
+}
+
+/// Expand glob patterns to actual file paths
+fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
+    // Check if pattern contains wildcards
+    if !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
+        // No wildcards - treat as literal path
+        let path = PathBuf::from(pattern);
+        if path.exists() {
+            return Ok(vec![path]);
+        } else {
+            return Err(anyhow!("Database not found: {}", pattern));
+        }
+    }
+
+    // Expand glob pattern
+    let paths: Vec<PathBuf> = glob::glob(pattern)
+        .map_err(|e| anyhow!("Invalid glob pattern '{}': {}", pattern, e))?
+        .filter_map(|entry| entry.ok())
+        .filter(|p| p.is_file())
+        .collect();
+
+    Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_minimal_config() {
+        let toml = r#"
+            [s3]
+            bucket = "s3://test-bucket"
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.s3.bucket, Some("s3://test-bucket".to_string()));
+        assert_eq!(config.databases.len(), 1);
+        assert_eq!(config.databases[0].path, "/data/test.db");
+    }
+
+    #[test]
+    fn test_parse_full_config() {
+        let toml = r#"
+            [s3]
+            bucket = "s3://backups/prod"
+            endpoint = "https://fly.storage.tigris.dev"
+
+            [sync]
+            snapshot_interval = 1800
+            max_changes = 100
+            max_interval = 300
+            on_idle = 60
+            on_startup = false
+            compact_after_snapshot = true
+            compact_interval = 7200
+
+            [retention]
+            hourly = 12
+            daily = 5
+            weekly = 8
+            monthly = 6
+
+            [[databases]]
+            path = "/var/lib/app.db"
+            prefix = "main"
+
+            [[databases]]
+            path = "/data/tenant-*.db"
+            prefix = "tenants"
+            snapshot_interval = 900
+            max_changes = 50
+
+            [[databases]]
+            path = "/data/analytics.db"
+            prefix = "analytics"
+            retention = { hourly = 6, daily = 3, weekly = 4, monthly = 3 }
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Check S3 config
+        assert_eq!(config.s3.bucket, Some("s3://backups/prod".to_string()));
+        assert_eq!(
+            config.s3.endpoint,
+            Some("https://fly.storage.tigris.dev".to_string())
+        );
+
+        // Check sync config
+        assert_eq!(config.sync.snapshot_interval, 1800);
+        assert_eq!(config.sync.max_changes, 100);
+        assert_eq!(config.sync.max_interval, 300);
+        assert_eq!(config.sync.on_idle, 60);
+        assert!(!config.sync.on_startup);
+        assert!(config.sync.compact_after_snapshot);
+        assert_eq!(config.sync.compact_interval, 7200);
+
+        // Check retention config
+        assert_eq!(config.retention.hourly, 12);
+        assert_eq!(config.retention.daily, 5);
+        assert_eq!(config.retention.weekly, 8);
+        assert_eq!(config.retention.monthly, 6);
+
+        // Check databases
+        assert_eq!(config.databases.len(), 3);
+        assert_eq!(config.databases[0].prefix, Some("main".to_string()));
+        assert_eq!(config.databases[1].snapshot_interval, Some(900));
+        assert_eq!(config.databases[1].max_changes, Some(50));
+        assert_eq!(config.databases[2].retention.as_ref().unwrap().hourly, 6);
+    }
+
+    #[test]
+    fn test_defaults_applied() {
+        let toml = r#"
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Check sync defaults
+        assert_eq!(config.sync.snapshot_interval, 3600);
+        assert_eq!(config.sync.max_changes, 0);
+        assert_eq!(config.sync.max_interval, 0);
+        assert_eq!(config.sync.on_idle, 0);
+        assert!(config.sync.on_startup);
+        assert!(!config.sync.compact_after_snapshot);
+        assert_eq!(config.sync.compact_interval, 0);
+
+        // Check retention defaults
+        assert_eq!(config.retention.hourly, 24);
+        assert_eq!(config.retention.daily, 7);
+        assert_eq!(config.retention.weekly, 12);
+        assert_eq!(config.retention.monthly, 12);
+    }
+
+    #[test]
+    fn test_validation_empty_path() {
+        let toml = r#"
+            [[databases]]
+            path = ""
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_zero_retention() {
+        let toml = r#"
+            [[databases]]
+            path = "/data/test.db"
+            retention = { hourly = 0, daily = 0, weekly = 0, monthly = 0 }
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_merge_sync_config() {
+        let toml = r#"
+            [sync]
+            snapshot_interval = 3600
+            max_changes = 100
+            max_interval = 300
+            on_idle = 60
+
+            [[databases]]
+            path = "/data/test.db"
+            snapshot_interval = 1800
+            max_changes = 50
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        let merged = config.merge_sync_config(&config.databases[0]);
+
+        // Overridden values
+        assert_eq!(merged.snapshot_interval, 1800);
+        assert_eq!(merged.max_changes, 50);
+
+        // Inherited values
+        assert_eq!(merged.max_interval, 300);
+        assert_eq!(merged.on_idle, 60);
+    }
+
+    #[test]
+    fn test_deny_unknown_fields() {
+        let toml = r#"
+            [s3]
+            bucket = "s3://test"
+            unknown_field = "should fail"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expand_glob_literal_nonexistent() {
+        let result = expand_glob("/nonexistent/path/to/database.db");
+        assert!(result.is_err());
+    }
+}
