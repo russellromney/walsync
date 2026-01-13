@@ -134,6 +134,75 @@ pub async fn list_objects(
     Ok(keys)
 }
 
+/// Upload bytes with SHA256 metadata for integrity verification
+pub async fn upload_bytes_with_checksum(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    data: Vec<u8>,
+    checksum: &str,
+) -> Result<()> {
+    let len = data.len();
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .metadata("x-amz-meta-sha256", checksum)
+        .body(ByteStream::from(data))
+        .send()
+        .await?;
+
+    tracing::debug!(
+        "Uploaded {} bytes to s3://{}/{} with checksum {}",
+        len, bucket, key, checksum
+    );
+    Ok(())
+}
+
+/// Upload file with SHA256 metadata
+pub async fn upload_file_with_checksum(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    path: &Path,
+    checksum: &str,
+) -> Result<()> {
+    let body = ByteStream::from_path(path).await?;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .metadata("x-amz-meta-sha256", checksum)
+        .body(body)
+        .send()
+        .await?;
+
+    tracing::debug!(
+        "Uploaded {} to s3://{}/{} with checksum {}",
+        path.display(),
+        bucket,
+        key,
+        checksum
+    );
+    Ok(())
+}
+
+/// Get SHA256 checksum from object metadata
+pub async fn get_checksum(client: &Client, bucket: &str, key: &str) -> Result<Option<String>> {
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(resp) => {
+            if let Some(metadata) = resp.metadata {
+                if let Some(checksum) = metadata.get("x-amz-meta-sha256") {
+                    return Ok(Some(checksum.clone()));
+                }
+            }
+            Ok(None)
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 /// Check if object exists
 #[allow(dead_code)]
 pub async fn exists(client: &Client, bucket: &str, key: &str) -> Result<bool> {

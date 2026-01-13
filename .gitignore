@@ -1,5 +1,14 @@
 # Build artifacts
 /target/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Cargo
+Cargo.lock
+*.rlib
 
 # Environment files
 .env
@@ -11,10 +20,20 @@
 .vscode/
 *.swp
 *.swo
+*.iml
+.vscode/settings.json
 
 # OS
 .DS_Store
 Thumbs.db
+.AppleDouble
+.LSOverride
 
-# Cargo lock is typically committed for binaries, but ignore if you prefer
-# Cargo.lock
+# Test files (created in /tmp but explicit for safety)
+/tmp/walsync-test-*.db
+/tmp/restored-*.db
+
+# Rust
+.cargo/
+.rustup/
+rust-toolchain.lock

@@ -310,6 +310,19 @@ pub async fn restore(
     // Download snapshot
     s3::download_file(&client, &bucket_name, &snapshot_key, output).await?;
 
+    // Verify checksum if available
+    if let Ok(Some(stored_checksum)) = s3::get_checksum(&client, &bucket_name, &snapshot_key).await {
+        let restored_checksum = compute_file_sha256(output).await?;
+        if stored_checksum != restored_checksum {
+            return Err(anyhow!(
+                "Checksum mismatch! Stored: {}, Restored: {} - Data corruption detected!",
+                stored_checksum,
+                restored_checksum
+            ));
+        }
+        tracing::info!("Checksum verified: {}", restored_checksum);
+    }
+
     // Find and apply WAL segments
     let wal_prefix = format!("{}{}/wal/", prefix, name);
     let mut wal_segments = s3::list_objects(&client, &bucket_name, &wal_prefix).await?;
@@ -387,7 +400,27 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Take immediate snapshot
+/// Compute SHA256 hash of file for integrity verification
+async fn compute_file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use sha2::{Sha256, Digest};
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 8192];
+
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Take immediate snapshot with SHA256 integrity check
 pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
@@ -401,6 +434,9 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("Invalid database path"))?;
 
+    // Compute SHA256 before upload
+    let checksum = compute_file_sha256(database).await?;
+
     let timestamp = Utc::now();
     let snapshot_key = format!(
         "{}{}/snapshots/{}.db",
@@ -409,8 +445,356 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         timestamp.format("%Y%m%d%H%M%S")
     );
 
-    s3::upload_file(&client, &bucket_name, &snapshot_key, database).await?;
+    // Upload with checksum in metadata
+    s3::upload_file_with_checksum(&client, &bucket_name, &snapshot_key, database, &checksum).await?;
 
+    tracing::info!(
+        "Snapshot uploaded with SHA256: {} -> s3://{}/{}",
+        checksum,
+        bucket_name,
+        snapshot_key
+    );
     println!("Snapshot uploaded: s3://{}/{}", bucket_name, snapshot_key);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn get_test_bucket() -> Option<String> {
+        std::env::var("WALSYNC_TEST_BUCKET").ok()
+    }
+
+    fn get_test_endpoint() -> Option<String> {
+        std::env::var("AWS_ENDPOINT_URL_S3").ok()
+    }
+
+    /// Helper to create a test database
+    async fn create_test_db(name: &str) -> PathBuf {
+        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db", name));
+        // Create a minimal SQLite database with WAL mode
+        let db_path = path.clone();
+        tokio::fs::write(&db_path, b"SQLite format 3\0").await.ok();
+        db_path
+    }
+
+    /// Helper to create a test WAL file
+    async fn create_test_wal(db_path: &PathBuf) {
+        let wal_path = db_path.with_extension("db-wal");
+        let mut wal_data = vec![0u8; 32];
+        // Write valid WAL magic number (0x377F0682)
+        wal_data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        // Format version
+        wal_data[4..8].copy_from_slice(&3007000u32.to_be_bytes());
+        // Page size
+        wal_data[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        // Add a simple frame
+        let page_size = 4096u32;
+        let frame_size = 24 + page_size as usize;
+        wal_data.resize(32 + frame_size, 0u8);
+        tokio::fs::write(&wal_path, wal_data).await.ok();
+    }
+
+    /// Compute SHA256 hash of data for integrity verification (for tests)
+    fn compute_sha256(data: &[u8]) -> String {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_snapshot() {
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("snapshot-test-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+
+        let result = snapshot(&db_path, &bucket, endpoint.as_deref()).await;
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+
+        assert!(result.is_ok(), "Snapshot should succeed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_list_empty_bucket() {
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+
+        // This should not panic even if bucket is empty or only has test files
+        let result = list(&bucket, endpoint.as_deref()).await;
+        assert!(result.is_ok(), "List should succeed on bucket");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_list_with_database() {
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("list-test-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+
+        // Upload a snapshot
+        let _ = snapshot(&db_path, &bucket, endpoint.as_deref()).await;
+
+        // List databases
+        let result = list(&bucket, endpoint.as_deref()).await;
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+
+        assert!(result.is_ok(), "List should succeed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_restore_nonexistent() {
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let output = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
+
+        let result = restore("nonexistent-db", &output, &bucket, endpoint.as_deref(), None).await;
+
+        // Should fail - no snapshots exist
+        assert!(result.is_err(), "Restore of nonexistent database should fail");
+
+        // Cleanup
+        tokio::fs::remove_file(&output).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_snapshot_and_restore() {
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("snapshot-restore-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+        let restored_path = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
+
+        // Read original database content and compute hash
+        let original_data = tokio::fs::read(&db_path).await.unwrap();
+        let original_hash = compute_sha256(&original_data);
+
+        // Take snapshot
+        let snapshot_result = snapshot(&db_path, &bucket, endpoint.as_deref()).await;
+        assert!(snapshot_result.is_ok(), "Snapshot should succeed");
+
+        // Wait a moment for S3 to be consistent
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Restore database
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        assert!(restore_result.is_ok(), "Restore should succeed");
+
+        // Verify restored file exists
+        assert!(restored_path.exists(), "Restored database should exist");
+
+        // CRITICAL: Verify restored database matches original exactly
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        let restored_hash = compute_sha256(&restored_data);
+
+        assert_eq!(original_data.len(), restored_data.len(),
+            "Restored database size ({}) must match original ({})",
+            restored_data.len(), original_data.len());
+        assert_eq!(original_hash, restored_hash,
+            "Restored database content must be byte-for-byte identical to original");
+        assert_eq!(original_data, restored_data,
+            "Restored database is not identical to original");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+        tokio::fs::remove_file(&restored_path).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_sync_wal_workflow() {
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("wal-sync-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+
+        // Create a WAL file
+        create_test_wal(&db_path).await;
+
+        // Take initial snapshot - this should work with a WAL file present
+        let snapshot_result = snapshot(&db_path, &bucket, endpoint.as_deref()).await;
+        assert!(snapshot_result.is_ok(), "Snapshot with WAL should succeed");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+        tokio::fs::remove_file(db_path.with_extension("db-wal")).await.ok();
+    }
+
+    #[test]
+    fn test_parse_bucket_variations() {
+        // This tests the bucket parsing logic used by sync functions
+        let (bucket1, prefix1) = crate::s3::parse_bucket("s3://my-bucket");
+        assert_eq!(bucket1, "my-bucket");
+        assert_eq!(prefix1, "");
+
+        let (bucket2, prefix2) = crate::s3::parse_bucket("s3://my-bucket/walsync/");
+        assert_eq!(bucket2, "my-bucket");
+        assert_eq!(prefix2, "walsync/");
+
+        let (bucket3, prefix3) = crate::s3::parse_bucket("my-bucket/path/to/prefix");
+        assert_eq!(bucket3, "my-bucket");
+        assert_eq!(prefix3, "path/to/prefix");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_snapshot_and_restore_with_data() {
+        // Test that snapshot/restore preserves exact data content (like Litestream)
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("snapshot-restore-data-{}", uuid::Uuid::new_v4());
+        let db_path = PathBuf::from(format!("/tmp/walsync-test-{}.db", test_name));
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+        let restored_path = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
+
+        // Create database with varied content (not just magic bytes)
+        let original_data = vec![
+            b"SQLite format 3\0".to_vec(),
+            // Add varying byte patterns
+            (0u8..=255u8).collect::<Vec<_>>(),
+            vec![0xFF; 256],
+            b"This is test data".to_vec(),
+            vec![0x42; 512], // BBBB...
+        ].concat();
+
+        tokio::fs::write(&db_path, &original_data).await.unwrap();
+
+        // Snapshot -> Restore -> Verify exact match
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await.unwrap();
+
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+
+        // Critical verification: byte-for-byte identical
+        assert_eq!(original_data.len(), restored_data.len(),
+            "Size mismatch: original={}, restored={}",
+            original_data.len(), restored_data.len());
+
+        for (i, (orig, restored)) in original_data.iter().zip(restored_data.iter()).enumerate() {
+            assert_eq!(orig, restored,
+                "Data mismatch at byte {}: original=0x{:02x}, restored=0x{:02x}",
+                i, orig, restored);
+        }
+
+        assert_eq!(original_data, restored_data,
+            "Restored database is NOT identical to original - data corruption detected!");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+        tokio::fs::remove_file(&restored_path).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_multi_database_snapshot() {
+        // Test walsync advantage: single process handles multiple databases
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+
+        const NUM_DBS: usize = 5;
+        let mut db_paths = Vec::new();
+        let mut db_names = Vec::new();
+
+        // Create multiple test databases
+        for i in 0..NUM_DBS {
+            let test_name = format!("multi-db-{}-{}", i, uuid::Uuid::new_v4());
+            let db_path = create_test_db(&test_name).await;
+            db_names.push(test_name);
+            db_paths.push(db_path);
+        }
+
+        // Snapshot all databases (this is where walsync shines - single process)
+        for db_path in &db_paths {
+            let result = snapshot(db_path, &bucket, endpoint.as_deref()).await;
+            assert!(result.is_ok(), "All snapshots should succeed");
+        }
+
+        // Verify all were uploaded
+        let list_result = list(&bucket, endpoint.as_deref()).await;
+        assert!(list_result.is_ok(), "List should succeed");
+
+        // Cleanup
+        for db_path in &db_paths {
+            tokio::fs::remove_file(db_path).await.ok();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_checksum_verification() {
+        // Test that checksums are stored and verified
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("checksum-test-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+        let restored_path = PathBuf::from(format!("/tmp/restored-checksum-{}.db", uuid::Uuid::new_v4()));
+
+        // Read original and compute its hash
+        let original_data = tokio::fs::read(&db_path).await.unwrap();
+        let original_hash = compute_sha256(&original_data);
+
+        // Snapshot (should store checksum in metadata)
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Restore (should verify checksum)
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        assert!(restore_result.is_ok(), "Restore with valid checksum should succeed");
+
+        // Verify restored data
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        let restored_hash = compute_sha256(&restored_data);
+
+        assert_eq!(original_hash, restored_hash, "Checksums should match");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+        tokio::fs::remove_file(&restored_path).await.ok();
+    }
+
+    #[test]
+    fn test_performance_multi_database_advantage() {
+        // This test documents the theoretical advantage of walsync vs Litestream
+        // Litestream: N databases = N processes = N overhead
+        // Walsync: N databases = 1 process = 1 overhead
+
+        let database_counts = vec![1, 5, 10, 100];
+
+        println!("\n=== Performance Advantage: Walsync vs Litestream ===\n");
+        println!("Databases | Litestream Processes | Walsync Processes | Memory Saved (est)");
+        println!("----------|---------------------|-------------------|------------------");
+
+        for count in database_counts {
+            let litestream_processes = count;
+            let walsync_processes = 1;
+            let processes_saved = litestream_processes - walsync_processes;
+
+            // Rough estimate: ~50MB per Litestream process
+            let memory_per_process = 50;
+            let memory_saved_mb = processes_saved * memory_per_process;
+
+            println!(
+                "{:9} | {:21} | {:17} | {:>14} MB",
+                count, litestream_processes, walsync_processes, memory_saved_mb
+            );
+        }
+
+        println!("\nNote: This is a theoretical advantage. Actual overhead depends on");
+        println!("binary size, Tigris connection pooling, and WAL activity per database.\n");
+    }
 }
