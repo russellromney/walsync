@@ -125,6 +125,75 @@ pub async fn read_wal(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// Parsed WAL frame with page number and data
+#[derive(Debug, Clone)]
+pub struct ParsedFrame {
+    pub page_number: u32,
+    pub db_size: u32, // Non-zero on commit frames
+    pub data: Vec<u8>,
+}
+
+/// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)
+pub async fn read_frames_as_pages(
+    path: &Path,
+    page_size: u32,
+    start_offset: u64,
+) -> Result<(Vec<ParsedFrame>, u64, u32)> {
+    let mut file = File::open(path).await?;
+    let file_size = file.metadata().await?.len();
+
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+    let start_pos = if start_offset == 0 {
+        WAL_HEADER_SIZE
+    } else {
+        start_offset
+    };
+
+    if start_pos >= file_size {
+        return Ok((Vec::new(), start_pos, 0));
+    }
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let available = file_size - start_pos;
+    let full_frames = available / frame_size;
+
+    if full_frames == 0 {
+        return Ok((Vec::new(), start_pos, 0));
+    }
+
+    let mut frames = Vec::with_capacity(full_frames as usize);
+    let mut max_db_size: u32 = 0;
+
+    for _ in 0..full_frames {
+        // Read frame header (24 bytes)
+        let mut header_buf = [0u8; 24];
+        file.read_exact(&mut header_buf).await?;
+
+        let page_number = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+
+        // Read page data
+        let mut page_data = vec![0u8; page_size as usize];
+        file.read_exact(&mut page_data).await?;
+
+        if db_size > max_db_size {
+            max_db_size = db_size;
+        }
+
+        frames.push(ParsedFrame {
+            page_number,
+            db_size,
+            data: page_data,
+        });
+    }
+
+    let new_offset = start_pos + full_frames * frame_size;
+
+    Ok((frames, new_offset, max_db_size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

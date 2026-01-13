@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use notify::{Event, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 use crate::wal;
 
@@ -22,8 +24,40 @@ struct DbState {
     wal_offset: u64,
     /// WAL generation (increments on checkpoint)
     wal_generation: u64,
+    /// Current transaction ID (for LTX files)
+    current_txid: u64,
     /// Last snapshot time
     last_snapshot: Option<chrono::DateTime<Utc>>,
+}
+
+/// Entry in the manifest tracking LTX files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LtxEntry {
+    /// Filename (e.g., "00000001-00000010.ltx")
+    pub filename: String,
+    /// Starting transaction ID
+    pub min_txid: u64,
+    /// Ending transaction ID
+    pub max_txid: u64,
+    /// File size in bytes
+    pub size: u64,
+    /// Upload timestamp (ISO 8601)
+    pub created_at: String,
+    /// Whether this is a snapshot (full DB) or incremental
+    pub is_snapshot: bool,
+}
+
+/// Manifest tracking all LTX files for a database
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Manifest {
+    /// Database name
+    pub name: String,
+    /// Current highest TXID
+    pub current_txid: u64,
+    /// Page size of the database
+    pub page_size: u32,
+    /// List of LTX files
+    pub files: Vec<LtxEntry>,
 }
 
 /// Watch multiple databases and sync to S3
@@ -52,24 +86,48 @@ pub async fn watch(
 
         let wal_path = db_path.with_extension("db-wal");
 
-        // Check for existing state in S3
-        let state_key = format!("{}{}/state.json", prefix, name);
-        let (wal_offset, wal_generation) = match s3::download_bytes(&client, &bucket_name, &state_key).await {
+        // Check for existing state in S3 (manifest.json)
+        let manifest_key = format!("{}{}/manifest.json", prefix, name);
+        let (wal_offset, wal_generation, current_txid) = match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
             Ok(data) => {
-                let state: serde_json::Value = serde_json::from_slice(&data)?;
-                (
-                    state["wal_offset"].as_u64().unwrap_or(0),
-                    state["wal_generation"].as_u64().unwrap_or(0),
-                )
+                let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
+                // For backwards compat, also check old state.json
+                let state_key = format!("{}{}/state.json", prefix, name);
+                let (offset, gen) = match s3::download_bytes(&client, &bucket_name, &state_key).await {
+                    Ok(state_data) => {
+                        let state: serde_json::Value = serde_json::from_slice(&state_data)?;
+                        (
+                            state["wal_offset"].as_u64().unwrap_or(0),
+                            state["wal_generation"].as_u64().unwrap_or(0),
+                        )
+                    }
+                    Err(_) => (0, 0),
+                };
+                (offset, gen, manifest.current_txid)
             }
-            Err(_) => (0, 0),
+            Err(_) => {
+                // Try old state.json for backwards compat
+                let state_key = format!("{}{}/state.json", prefix, name);
+                match s3::download_bytes(&client, &bucket_name, &state_key).await {
+                    Ok(data) => {
+                        let state: serde_json::Value = serde_json::from_slice(&data)?;
+                        (
+                            state["wal_offset"].as_u64().unwrap_or(0),
+                            state["wal_generation"].as_u64().unwrap_or(0),
+                            state["current_txid"].as_u64().unwrap_or(0),
+                        )
+                    }
+                    Err(_) => (0, 0, 0),
+                }
+            }
         };
 
         tracing::info!(
-            "Watching {} (WAL offset: {}, generation: {})",
+            "Watching {} (WAL offset: {}, generation: {}, TXID: {})",
             db_path.display(),
             wal_offset,
-            wal_generation
+            wal_generation,
+            current_txid
         );
 
         db_states.insert(
@@ -80,6 +138,7 @@ pub async fn watch(
                 wal_path,
                 wal_offset,
                 wal_generation,
+                current_txid,
                 last_snapshot: None,
             },
         );
@@ -152,7 +211,7 @@ pub async fn watch(
     }
 }
 
-/// Sync WAL changes to S3
+/// Sync WAL changes to S3 as incremental LTX files
 async fn sync_wal(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -173,40 +232,90 @@ async fn sync_wal(
         state.wal_generation += 1;
     }
 
-    // Read new frames
-    let (frames, new_offset, frame_count) =
-        wal::read_frames_from(&state.wal_path, header.page_size, state.wal_offset).await?;
+    // Read and parse WAL frames into pages
+    let (frames, new_offset, max_db_size) =
+        wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
 
-    if frame_count == 0 {
+    if frames.is_empty() {
         return Ok(());
     }
 
-    // Upload WAL segment
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f");
-    let wal_key = format!(
-        "{}{}/wal/{:08}-{}.wal",
-        prefix, state.name, state.wal_generation, timestamp
-    );
+    let timestamp = Utc::now();
 
-    s3::upload_bytes(client, bucket, &wal_key, frames).await?;
+    // Convert frames to pages for LTX encoding
+    let pages: Vec<(u32, Vec<u8>)> = frames
+        .iter()
+        .map(|f| (f.page_number, f.data.clone()))
+        .collect();
+
+    // Determine commit page (last frame with non-zero db_size, or last page)
+    let commit_page = frames
+        .iter()
+        .rev()
+        .find(|f| f.db_size > 0)
+        .map(|f| f.db_size)
+        .unwrap_or(max_db_size.max(1));
+
+    // Calculate TXID range for this incremental
+    let min_txid = state.current_txid + 1;
+    let max_txid = min_txid + frames.len() as u64 - 1;
+
+    // Encode as incremental LTX
+    let mut ltx_buffer = Vec::new();
+    let _checksum = ltx::encode_wal_changes(
+        &mut ltx_buffer,
+        &pages,
+        header.page_size,
+        min_txid,
+        max_txid,
+        commit_page,
+        None, // pre_checksum (we could track this for chain verification)
+    )?;
+
+    let ltx_size = ltx_buffer.len() as u64;
+
+    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
+    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+    let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+
+    // Upload LTX file
+    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
 
     tracing::info!(
-        "{}: Synced {} WAL frames ({} -> {})",
+        "{}: Synced {} WAL frames as LTX {} (TXID: {}-{}, size: {} bytes)",
         state.name,
-        frame_count,
-        state.wal_offset,
-        new_offset
+        frames.len(),
+        ltx_filename,
+        min_txid,
+        max_txid,
+        ltx_size
     );
 
-    state.wal_offset = new_offset;
+    // Update manifest
+    let mut manifest = load_manifest(client, bucket, prefix, &state.name).await?;
+    manifest.current_txid = max_txid;
+    manifest.page_size = header.page_size;
+    manifest.files.push(LtxEntry {
+        filename: ltx_filename,
+        min_txid,
+        max_txid,
+        size: ltx_size,
+        created_at: timestamp.to_rfc3339(),
+        is_snapshot: false,
+    });
+    save_manifest(client, bucket, prefix, &manifest).await?;
 
-    // Save state
+    // Update state
+    state.wal_offset = new_offset;
+    state.current_txid = max_txid;
+
+    // Save legacy state for backwards compat
     save_state(client, bucket, prefix, state).await?;
 
     Ok(())
 }
 
-/// Take a full database snapshot
+/// Take a full database snapshot as LTX
 async fn take_snapshot(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -214,27 +323,73 @@ async fn take_snapshot(
     state: &mut DbState,
 ) -> Result<()> {
     let timestamp = Utc::now();
-    let snapshot_key = format!(
-        "{}{}/snapshots/{}.db",
-        prefix,
+
+    // Get page size from database header
+    let page_size = get_page_size(&state.db_path).await?;
+
+    // Increment TXID for this snapshot
+    let new_txid = state.current_txid + 1;
+
+    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
+    // For a snapshot, min=1 and max=new_txid (it contains all pages up to this point)
+    let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
+    let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+
+    // Encode database as LTX
+    let mut ltx_buffer = Vec::new();
+    ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
+
+    let ltx_size = ltx_buffer.len() as u64;
+
+    // Upload LTX file
+    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
+
+    tracing::info!(
+        "{}: LTX snapshot uploaded to {} (TXID: {}, size: {} bytes)",
         state.name,
-        timestamp.format("%Y%m%d%H%M%S")
+        ltx_key,
+        new_txid,
+        ltx_size
     );
 
-    // Upload the main database file
-    s3::upload_file(client, bucket, &snapshot_key, &state.db_path).await?;
+    // Update manifest
+    let mut manifest = load_manifest(client, bucket, prefix, &state.name).await?;
+    manifest.current_txid = new_txid;
+    manifest.page_size = page_size;
+    manifest.files.push(LtxEntry {
+        filename: ltx_filename,
+        min_txid: 1,
+        max_txid: new_txid,
+        size: ltx_size,
+        created_at: timestamp.to_rfc3339(),
+        is_snapshot: true,
+    });
+    save_manifest(client, bucket, prefix, &manifest).await?;
 
-    tracing::info!("{}: Snapshot uploaded to {}", state.name, snapshot_key);
-
+    // Update state
+    state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
-
-    // Reset WAL tracking after snapshot (checkpoint should have happened or will happen)
-    // Note: In production, you might want to trigger a checkpoint here
 
     Ok(())
 }
 
-/// Save sync state to S3
+/// Get SQLite database page size from header
+async fn get_page_size(db_path: &Path) -> Result<u32> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(db_path).await?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header).await?;
+
+    // Page size is at offset 16-17, big-endian
+    let page_size = u16::from_be_bytes([header[16], header[17]]) as u32;
+
+    // Page size of 1 means 65536
+    let page_size = if page_size == 1 { 65536 } else { page_size };
+
+    Ok(page_size)
+}
+
+/// Save sync state to S3 (legacy state.json for backwards compat)
 async fn save_state(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -245,6 +400,7 @@ async fn save_state(
     let state_json = serde_json::json!({
         "wal_offset": state.wal_offset,
         "wal_generation": state.wal_generation,
+        "current_txid": state.current_txid,
         "last_snapshot": state.last_snapshot,
     });
 
@@ -259,7 +415,42 @@ async fn save_state(
     Ok(())
 }
 
-/// Restore a database from S3
+/// Load manifest from S3
+async fn load_manifest(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+) -> Result<Manifest> {
+    let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
+    match s3::download_bytes(client, bucket, &manifest_key).await {
+        Ok(data) => Ok(serde_json::from_slice(&data)?),
+        Err(_) => Ok(Manifest {
+            name: db_name.to_string(),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Save manifest to S3
+async fn save_manifest(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    manifest: &Manifest,
+) -> Result<()> {
+    let manifest_key = format!("{}{}/manifest.json", prefix, manifest.name);
+    s3::upload_bytes(
+        client,
+        bucket,
+        &manifest_key,
+        serde_json::to_vec_pretty(manifest)?,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Restore a database from S3 using LTX files
 pub async fn restore(
     name: &str,
     output: &Path,
@@ -270,7 +461,112 @@ pub async fn restore(
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
 
-    // Find latest snapshot before point_in_time (or just latest)
+    // Load manifest to find LTX files
+    let manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
+
+    if manifest.files.is_empty() {
+        // Fall back to legacy snapshot-based restore for backwards compatibility
+        return restore_legacy(name, output, bucket, endpoint, point_in_time).await;
+    }
+
+    // Parse point in time if provided (as TXID or timestamp)
+    let target_txid = if let Some(pit) = point_in_time {
+        // Try parsing as TXID first
+        if let Ok(txid) = pit.parse::<u64>() {
+            txid
+        } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(pit) {
+            // Find latest file before timestamp
+            manifest
+                .files
+                .iter()
+                .filter(|f| {
+                    chrono::DateTime::parse_from_rfc3339(&f.created_at)
+                        .map(|fdt| fdt <= dt)
+                        .unwrap_or(false)
+                })
+                .map(|f| f.max_txid)
+                .max()
+                .ok_or_else(|| anyhow!("No LTX file found before {}", pit))?
+        } else {
+            return Err(anyhow!(
+                "Invalid point_in_time format. Use TXID (number) or ISO 8601 timestamp"
+            ));
+        }
+    } else {
+        manifest.current_txid
+    };
+
+    // Find the best snapshot that covers our target TXID
+    // A snapshot has min_txid=1 and should have max_txid >= target_txid
+    let snapshot = manifest
+        .files
+        .iter()
+        .filter(|f| f.is_snapshot && f.max_txid <= target_txid)
+        .max_by_key(|f| f.max_txid)
+        .ok_or_else(|| anyhow!("No LTX snapshot found for TXID {}", target_txid))?;
+
+    tracing::info!(
+        "Restoring from LTX snapshot: {} (TXID: {}-{})",
+        snapshot.filename,
+        snapshot.min_txid,
+        snapshot.max_txid
+    );
+
+    // Download and decode LTX snapshot
+    let ltx_key = format!("{}{}/{}", prefix, name, snapshot.filename);
+    let ltx_data = s3::download_bytes(&client, &bucket_name, &ltx_key).await?;
+
+    let cursor = std::io::Cursor::new(ltx_data);
+    let header = ltx::decode_to_db(cursor, output)?;
+
+    tracing::info!(
+        "Restored {} from LTX (page_size: {}, pages: {}, TXID: {}-{})",
+        name,
+        header.page_size.into_inner(),
+        header.commit.into_inner(),
+        header.min_txid.into_inner(),
+        header.max_txid.into_inner()
+    );
+
+    // Find incremental LTX files to apply (if any)
+    let incrementals: Vec<_> = manifest
+        .files
+        .iter()
+        .filter(|f| {
+            !f.is_snapshot
+                && f.min_txid > snapshot.max_txid
+                && f.max_txid <= target_txid
+        })
+        .collect();
+
+    if !incrementals.is_empty() {
+        tracing::info!("Found {} incremental LTX files to apply", incrementals.len());
+        // TODO: Apply incremental LTX files
+        // For now, snapshots are sufficient for basic restore
+        tracing::warn!("Incremental LTX replay not yet implemented - using snapshot only");
+    }
+
+    println!(
+        "Restored {} to {} (TXID: {})",
+        name,
+        output.display(),
+        snapshot.max_txid
+    );
+    Ok(())
+}
+
+/// Legacy restore for backwards compatibility with raw .db snapshots
+async fn restore_legacy(
+    name: &str,
+    output: &Path,
+    bucket: &str,
+    endpoint: Option<&str>,
+    point_in_time: Option<&str>,
+) -> Result<()> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint).await?;
+
+    // Find legacy snapshots
     let snapshots_prefix = format!("{}{}/snapshots/", prefix, name);
     let snapshots = s3::list_objects(&client, &bucket_name, &snapshots_prefix).await?;
 
@@ -278,20 +574,19 @@ pub async fn restore(
         return Err(anyhow!("No snapshots found for database: {}", name));
     }
 
-    // Parse point in time if provided
     let pit = point_in_time
         .map(|s| chrono::DateTime::parse_from_rfc3339(s))
         .transpose()?
         .map(|dt| dt.with_timezone(&Utc));
 
-    // Find best snapshot
     let snapshot_key = if let Some(pit) = pit {
-        // Find latest snapshot before point_in_time
         snapshots
             .iter()
             .filter(|k| {
-                // Extract timestamp from key
-                if let Some(ts) = k.strip_prefix(&snapshots_prefix).and_then(|s| s.strip_suffix(".db")) {
+                if let Some(ts) = k
+                    .strip_prefix(&snapshots_prefix)
+                    .and_then(|s| s.strip_suffix(".db"))
+                {
                     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%d%H%M%S") {
                         return dt.and_utc() <= pit;
                     }
@@ -302,57 +597,27 @@ pub async fn restore(
             .ok_or_else(|| anyhow!("No snapshot found before {}", pit))?
             .clone()
     } else {
-        snapshots.last().cloned().ok_or_else(|| anyhow!("No snapshots"))?
+        snapshots
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("No snapshots"))?
     };
 
-    tracing::info!("Restoring from snapshot: {}", snapshot_key);
-
-    // Download snapshot
+    tracing::info!("Restoring from legacy snapshot: {}", snapshot_key);
     s3::download_file(&client, &bucket_name, &snapshot_key, output).await?;
 
-    // Verify checksum if available
-    if let Ok(Some(stored_checksum)) = s3::get_checksum(&client, &bucket_name, &snapshot_key).await {
+    if let Ok(Some(stored_checksum)) =
+        s3::get_checksum(&client, &bucket_name, &snapshot_key).await
+    {
         let restored_checksum = compute_file_sha256(output).await?;
         if stored_checksum != restored_checksum {
             return Err(anyhow!(
-                "Checksum mismatch! Stored: {}, Restored: {} - Data corruption detected!",
+                "Checksum mismatch! Stored: {}, Restored: {}",
                 stored_checksum,
                 restored_checksum
             ));
         }
         tracing::info!("Checksum verified: {}", restored_checksum);
-    }
-
-    // Find and apply WAL segments
-    let wal_prefix = format!("{}{}/wal/", prefix, name);
-    let mut wal_segments = s3::list_objects(&client, &bucket_name, &wal_prefix).await?;
-    wal_segments.sort();
-
-    // Filter WAL segments: only those after snapshot
-    let snapshot_ts = snapshot_key
-        .strip_prefix(&snapshots_prefix)
-        .and_then(|s| s.strip_suffix(".db"))
-        .unwrap_or("");
-
-    let wal_segments: Vec<_> = wal_segments
-        .into_iter()
-        .filter(|k| {
-            if let Some(ts) = k.strip_prefix(&wal_prefix).and_then(|s| s.strip_suffix(".wal")) {
-                // WAL format: {generation}-{timestamp}.wal
-                if let Some((_, ts_part)) = ts.split_once('-') {
-                    return ts_part > snapshot_ts;
-                }
-            }
-            false
-        })
-        .collect();
-
-    if !wal_segments.is_empty() {
-        tracing::info!("Applying {} WAL segments", wal_segments.len());
-
-        // For now, we just note that WAL replay would happen here
-        // Full WAL replay requires SQLite integration
-        tracing::warn!("WAL replay not yet implemented - snapshot only restore");
     }
 
     tracing::info!("Restored {} to {}", name, output.display());
@@ -420,7 +685,7 @@ async fn compute_file_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Take immediate snapshot with SHA256 integrity check
+/// Take immediate snapshot as LTX file
 pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
@@ -434,27 +699,53 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("Invalid database path"))?;
 
-    // Compute SHA256 before upload
-    let checksum = compute_file_sha256(database).await?;
-
     let timestamp = Utc::now();
-    let snapshot_key = format!(
-        "{}{}/snapshots/{}.db",
-        prefix,
-        name,
-        timestamp.format("%Y%m%d%H%M%S")
-    );
 
-    // Upload with checksum in metadata
-    s3::upload_file_with_checksum(&client, &bucket_name, &snapshot_key, database, &checksum).await?;
+    // Get page size from database header
+    let page_size = get_page_size(database).await?;
+
+    // Load existing manifest to get current TXID
+    let mut manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
+    let new_txid = manifest.current_txid + 1;
+
+    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
+    // For a snapshot, min=1 (contains all pages)
+    let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
+    let ltx_key = format!("{}{}/{}", prefix, name, ltx_filename);
+
+    // Encode database as LTX
+    let mut ltx_buffer = Vec::new();
+    ltx::encode_snapshot(&mut ltx_buffer, database, page_size, new_txid)?;
+
+    let ltx_size = ltx_buffer.len() as u64;
+
+    // Upload LTX file
+    s3::upload_bytes(&client, &bucket_name, &ltx_key, ltx_buffer).await?;
+
+    // Update manifest
+    manifest.name = name.to_string();
+    manifest.current_txid = new_txid;
+    manifest.page_size = page_size;
+    manifest.files.push(LtxEntry {
+        filename: ltx_filename.clone(),
+        min_txid: 1,
+        max_txid: new_txid,
+        size: ltx_size,
+        created_at: timestamp.to_rfc3339(),
+        is_snapshot: true,
+    });
+    save_manifest(&client, &bucket_name, &prefix, &manifest).await?;
 
     tracing::info!(
-        "Snapshot uploaded with SHA256: {} -> s3://{}/{}",
-        checksum,
-        bucket_name,
-        snapshot_key
+        "LTX snapshot uploaded: {} (TXID: {}, size: {} bytes)",
+        ltx_key,
+        new_txid,
+        ltx_size
     );
-    println!("Snapshot uploaded: s3://{}/{}", bucket_name, snapshot_key);
+    println!(
+        "Snapshot uploaded: s3://{}/{} (TXID: {})",
+        bucket_name, ltx_key, new_txid
+    );
     Ok(())
 }
 
