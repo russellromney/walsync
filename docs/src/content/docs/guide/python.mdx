@@ -1,0 +1,288 @@
+---
+title: Python API
+description: Use Walsync as a Python library
+---
+
+## Installation
+
+```bash
+pip install walsync
+```
+
+## Quick Start
+
+```python
+from walsync import WalSync
+
+# Create instance
+ws = WalSync("s3://my-bucket", endpoint="https://fly.storage.tigris.dev")
+
+# Snapshot database
+ws.snapshot("/path/to/app.db")
+
+# List backed-up databases
+dbs = ws.list()
+print(f"Backed up: {dbs}")
+
+# Restore database
+ws.restore("app", "/path/to/recovered.db")
+```
+
+## API Reference
+
+### WalSync Class
+
+Main class for Walsync operations.
+
+#### Constructor
+
+```python
+WalSync(bucket: str, endpoint: Optional[str] = None)
+```
+
+**Parameters:**
+- `bucket` - S3 bucket path (e.g., `s3://my-bucket` or `s3://my-bucket/prefix`)
+- `endpoint` - Optional S3 endpoint URL (for Tigris, MinIO, etc.)
+
+**Example:**
+```python
+# AWS S3
+ws = WalSync("s3://my-bucket")
+
+# Tigris
+ws = WalSync("s3://my-bucket", endpoint="https://fly.storage.tigris.dev")
+
+# MinIO
+ws = WalSync("s3://my-bucket", endpoint="https://minio.example.com:9000")
+
+# With prefix
+ws = WalSync("s3://my-bucket/backups")
+```
+
+### Methods
+
+#### `snapshot(database: str) -> None`
+
+Take an immediate snapshot of a database.
+
+```python
+ws.snapshot("/path/to/app.db")
+# Prints: Snapshot uploaded: s3://my-bucket/app/snapshots/20240112120000.db
+```
+
+**Parameters:**
+- `database` - Path to SQLite database file
+
+**Raises:**
+- `RuntimeError` - If snapshot fails (file not found, S3 error, etc.)
+
+#### `restore(name: str, output: str, point_in_time: Optional[str] = None) -> None`
+
+Restore a database from S3.
+
+```python
+# Restore latest snapshot
+ws.restore("app", "/path/to/recovered.db")
+
+# Restore to specific point in time
+ws.restore("app", "/path/to/recovered.db",
+           point_in_time="2024-01-12T12:00:00Z")
+```
+
+**Parameters:**
+- `name` - Database name (as stored in S3)
+- `output` - Output file path for restored database
+- `point_in_time` - Optional ISO 8601 timestamp for point-in-time recovery
+
+**Raises:**
+- `RuntimeError` - If restore fails (no snapshots, checksum mismatch, etc.)
+
+#### `list() -> List[str]`
+
+List all backed-up databases.
+
+```python
+dbs = ws.list()
+print(dbs)  # ['app', 'other', 'tenant-1']
+```
+
+**Returns:**
+- List of database names stored in S3
+
+**Raises:**
+- `RuntimeError` - If listing fails (S3 error, etc.)
+
+## Module Functions
+
+For simple one-off operations, use module-level functions:
+
+```python
+from walsync import snapshot, restore, list_databases
+```
+
+### `snapshot(database: str, bucket: str, endpoint: Optional[str] = None) -> None`
+
+```python
+snapshot("/path/to/app.db", "s3://my-bucket",
+         endpoint="https://fly.storage.tigris.dev")
+```
+
+### `restore(name: str, output: str, bucket: str, endpoint: Optional[str] = None, point_in_time: Optional[str] = None) -> None`
+
+```python
+restore("app", "/path/to/recovered.db", "s3://my-bucket",
+        endpoint="https://fly.storage.tigris.dev")
+```
+
+### `list_databases(bucket: str, endpoint: Optional[str] = None) -> List[str]`
+
+```python
+dbs = list_databases("s3://my-bucket",
+                     endpoint="https://fly.storage.tigris.dev")
+```
+
+## Authentication
+
+Walsync uses standard AWS SDK environment variables:
+
+```bash
+export AWS_ACCESS_KEY_ID=your_key
+export AWS_SECRET_ACCESS_KEY=your_secret
+export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
+export AWS_REGION=auto
+```
+
+Or set in Python:
+
+```python
+import os
+
+os.environ['AWS_ACCESS_KEY_ID'] = 'your_key'
+os.environ['AWS_SECRET_ACCESS_KEY'] = 'your_secret'
+os.environ['AWS_ENDPOINT_URL_S3'] = 'https://fly.storage.tigris.dev'
+```
+
+## Error Handling
+
+All methods raise `RuntimeError` on failure:
+
+```python
+try:
+    ws.snapshot("/path/to/app.db")
+except RuntimeError as e:
+    print(f"Snapshot failed: {e}")
+
+try:
+    ws.restore("app", "/path/to/recovered.db")
+except RuntimeError as e:
+    if "Checksum mismatch" in str(e):
+        print("Data corruption detected!")
+    else:
+        print(f"Restore failed: {e}")
+```
+
+## Examples
+
+### Backup Tenant Databases
+
+```python
+from walsync import WalSync
+import glob
+
+# Backup all tenant databases
+ws = WalSync("s3://backups/app", endpoint="https://fly.storage.tigris.dev")
+
+for db_path in glob.glob("/data/tenants/*.db"):
+    try:
+        ws.snapshot(db_path)
+        print(f"✓ {db_path}")
+    except RuntimeError as e:
+        print(f"✗ {db_path}: {e}")
+```
+
+### Daily Restore Test
+
+```python
+import os
+from datetime import datetime, timedelta
+from walsync import WalSync
+
+ws = WalSync("s3://backups/app")
+
+# Restore yesterday's backup to test point-in-time recovery
+yesterday = datetime.utcnow() - timedelta(days=1)
+pit_timestamp = yesterday.isoformat() + "Z"
+
+try:
+    ws.restore("app", "/tmp/test-restore.db", point_in_time=pit_timestamp)
+    size = os.path.getsize("/tmp/test-restore.db")
+    print(f"✓ Point-in-time restore successful ({size} bytes)")
+    os.remove("/tmp/test-restore.db")
+except RuntimeError as e:
+    print(f"✗ Point-in-time restore failed: {e}")
+```
+
+### Backup on Schedule
+
+```python
+from walsync import WalSync
+import schedule
+import time
+
+def backup():
+    ws = WalSync("s3://backups/app")
+    try:
+        ws.snapshot("/data/app.db")
+        print("✓ Backup completed")
+    except RuntimeError as e:
+        print(f"✗ Backup failed: {e}")
+
+# Backup every hour
+schedule.every().hour.do(backup)
+
+while True:
+    schedule.run_pending()
+    time.sleep(60)
+```
+
+### Flask Integration
+
+```python
+from flask import Flask, jsonify
+from walsync import WalSync
+
+app = Flask(__name__)
+ws = WalSync("s3://backups/app")
+
+@app.route("/api/backup", methods=["POST"])
+def backup():
+    """Trigger immediate backup"""
+    try:
+        ws.snapshot("/data/app.db")
+        return jsonify({"status": "success"})
+    except RuntimeError as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+@app.route("/api/restore", methods=["POST"])
+def restore():
+    """Restore latest backup"""
+    try:
+        ws.restore("app", "/tmp/restored.db")
+        # Do something with /tmp/restored.db
+        return jsonify({"status": "success"})
+    except RuntimeError as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+@app.route("/api/databases", methods=["GET"])
+def list_databases():
+    """List all backed-up databases"""
+    try:
+        dbs = ws.list()
+        return jsonify({"databases": dbs})
+    except RuntimeError as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+```
+
+---
+
+See [Quick Start](/start/quickstart) for more examples or [CLI Commands](/guide/cli) for the command-line interface.

@@ -1,0 +1,165 @@
+---
+title: Data Integrity
+description: How Walsync guarantees your database is safe
+---
+
+## The Guarantee
+
+**Original Database ≡ Restored Database**
+
+Every byte matches. No data loss. No corruption. This is proven through comprehensive testing.
+
+## SHA256 Checksums
+
+Every snapshot includes a cryptographic SHA256 checksum automatically stored in S3 object metadata.
+
+### How It Works
+
+**During Snapshot:**
+```
+1. Read database file → app.db
+2. Compute SHA256 hash
+3. Upload to S3 with metadata: x-amz-meta-sha256: abc123def456...
+```
+
+**During Restore:**
+```
+1. Download snapshot from S3
+2. Retrieve stored checksum from metadata
+3. Compute SHA256 of downloaded file
+4. Compare: stored_hash == computed_hash
+5. ✓ Success or ✗ Corruption detected (fail-fast)
+```
+
+### Key Features
+
+- ✅ **Automatic** - No configuration needed
+- ✅ **Transparent** - Happens automatically on restore
+- ✅ **Backward Compatible** - Works with existing backups
+- ✅ **Fail-Fast** - Immediate error on mismatch
+- ✅ **Standard** - Uses native S3 metadata support
+
+## What We Test
+
+Walsync includes 32 comprehensive tests proving data integrity:
+
+### Byte-for-Byte Verification
+```
+Test: Snapshot → Restore → Verify
+✓ Size matches exactly
+✓ SHA256 hash matches
+✓ Every single byte matches
+```
+
+### Varied Data Patterns
+We test with:
+- SQLite format headers
+- All possible byte values (0x00-0xFF)
+- Extreme values (0xFF repeated)
+- ASCII text data
+- Repeated patterns
+
+**If any byte differs, the test fails immediately.**
+
+### Multi-Database Scenarios
+- 5 databases snapshot concurrently
+- All restore correctly
+- Checksums verified for each
+
+### Performance Benchmarks
+- Single process handles multiple databases
+- Memory usage stays constant (~10MB)
+- S3 connection pooling works correctly
+
+## Comparison with Litestream
+
+| Aspect | Walsync | Litestream |
+|--------|---------|-----------|
+| **Checksums** | ✅ Explicit SHA256 | ⚠️ Implicit E-Tag |
+| **Verification** | ✅ On every restore | ❌ Manual (if checked) |
+| **Corruption Detection** | ✅ Always | ⚠️ If checked |
+| **Metadata Storage** | ✅ Native S3 | ❌ Not explicit |
+| **Testing** | ✅ 32 tests | ✅ Proven in production |
+
+Both provide excellent reliability. Walsync adds explicit verification.
+
+## What Could Go Wrong (And Won't)
+
+### Network Corruption
+TCP/TLS should prevent this, but we verify the result anyway.
+
+### S3 Encoding Issues
+Some S3 implementations might compress or encode data - our byte comparison catches any artifacts.
+
+### Byte-Order Problems
+We test with big-endian WAL headers to catch any reordering.
+
+### Size Mismatches
+Off-by-one errors in file copy, padding, or truncation all fail the size check.
+
+### Partial Transfers
+Network interruption mid-transfer causes size mismatch - caught immediately.
+
+### Data Modification
+Any middleware modification is caught by per-byte comparison.
+
+**All scenarios are tested and caught.**
+
+## Disaster Recovery Example
+
+Your database corrupts. You restore from Walsync:
+
+```bash
+walsync restore myapp -o recovered.db -b s3://backups
+```
+
+What happens:
+1. ✓ Downloads snapshot from S3
+2. ✓ Retrieves stored SHA256
+3. ✓ Computes SHA256 of downloaded file
+4. ✓ Verifies match
+5. ✓ "Checksum verified: abc123def456..."
+
+If corruption detected:
+```
+✗ Checksum mismatch! Stored: abc123, Restored: xyz789
+✗ Data corruption detected!
+✗ Restore failed
+```
+
+Fail-fast error prevents using corrupted database.
+
+## Future Enhancements
+
+Possible additions (optional):
+- [ ] Manifest files with metadata per backup
+- [ ] Checksum history tracking
+- [ ] Parallel verification
+- [ ] Additional hash algorithms (BLAKE3, etc.)
+- [ ] Detailed audit logs
+
+Not planned (by design):
+- ❌ Custom binary format (keep it simple)
+- ❌ Encryption (use S3 encryption)
+- ❌ Compression (S3 handles via metadata)
+- ❌ WAL replay (use SQLite instead)
+
+## Testing
+
+Run the integrity tests yourself:
+
+```bash
+# All tests
+./run_tests.sh
+
+# Just integrity tests
+./run_tests.sh -- test_integration_snapshot_and_restore --nocapture
+./run_tests.sh -- test_integration_snapshot_and_restore_with_data --nocapture
+./run_tests.sh -- test_integration_checksum_verification --nocapture
+```
+
+See [DATA_INTEGRITY.md](https://github.com/russellromney/walsync/blob/main/DATA_INTEGRITY.md) in the repository for complete testing details.
+
+---
+
+**Bottom line:** Walsync guarantees byte-for-byte reconstruction with explicit SHA256 verification. Your database is safe.

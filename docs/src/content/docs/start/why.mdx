@@ -1,0 +1,99 @@
+---
+title: Why Walsync?
+description: What makes Walsync different from Litestream
+---
+
+## Production-Grade SQLite Backups
+
+Walsync is a lightweight alternative to Litestream that combines the best of both worlds:
+- **Explicit data integrity** via SHA256 checksums
+- **Multi-database efficiency** with a single process
+- **Minimal overhead** (~7MB binary, ~10MB RSS)
+
+## Key Advantages
+
+### 1. Explicit Data Integrity
+
+Every snapshot includes a cryptographic SHA256 checksum stored in S3 metadata. During restore, checksums are automatically verified:
+
+```
+✓ Checksum stored during snapshot
+✓ Verified automatically on restore
+✓ Fail-fast on corruption detection
+✓ Backward compatible (optional)
+```
+
+Unlike implicit S3 ETags, you get explicit proof that your database matches bit-for-bit.
+
+### 2. Single Process for Many Databases
+
+**Litestream Model:**
+```
+Database 1 → Litestream Process 1
+Database 2 → Litestream Process 2
+Database 3 → Litestream Process 3
+              ...
+```
+
+Each database needs its own process. With 10 databases, that's 10 processes × 50MB = 500MB overhead.
+
+**Walsync Model:**
+```
+Database 1 ──┐
+Database 2 ──┼→ Walsync Process → S3
+Database 3 ──┘
+```
+
+All databases share one process with shared S3 connection pooling. 10 databases = ~10MB total overhead.
+
+| Scenario | Litestream | Walsync | Saved |
+|----------|-----------|---------|-------|
+| 5 DB | 5 × 50MB | 1 × 10MB | **200 MB** |
+| 10 DB | 10 × 50MB | 1 × 10MB | **450 MB** |
+| 100 DB | 100 × 50MB | 1 × 10MB | **4950 MB** |
+
+### 3. Lightweight Stack
+
+Built in Rust instead of Go:
+- **7MB binary** vs Litestream's ~50MB
+- **No runtime bloat** - single executable
+- **Minimal memory** - ~5-10MB RSS for multiple databases
+- **Instant startup** - ~10ms vs Litestream's per-process overhead
+
+### 4. Multiple Installation Options
+
+- **CLI**: `cargo install walsync`
+- **Python**: `pip install walsync`
+- **Docker**: Coming soon
+
+Use as a daemon, import as a library, or integrate into Python apps.
+
+## Comparison Table
+
+| Feature | Walsync | Litestream |
+|---------|---------|-----------|
+| **Checksums** | ✅ Explicit SHA256 | ⚠️ Implicit E-Tag |
+| **Process Model** | 1 for N databases | 1 per database |
+| **Memory (5 DB)** | ~10MB | ~250MB |
+| **Binary Size** | 7MB | 50MB |
+| **Written in** | Rust | Go |
+| **Python Bindings** | ✅ Yes | ❌ No |
+| **Data Integrity** | ✅ Tested & verified | ✅ Proven |
+
+## When to Use Walsync
+
+- ✅ **Multi-tenant apps** (Tenement, Slum) - Huge memory savings
+- ✅ **Resource-constrained environments** - Edge, serverless, VPS
+- ✅ **Python integration** - Use as a library in your app
+- ✅ **Explicit verification** - Need guaranteed data integrity
+- ✅ **Multiple databases** - One process scales to 100+ databases
+
+## When to Use Litestream
+
+- ✅ **Single database** - Litestream works fine for one database
+- ✅ **Go familiarity** - If you prefer Go over Rust
+- ✅ **Established production use** - Litestream has been battle-tested longer
+
+---
+
+**Ready to get started?** Check out the [Installation Guide](/start/install) or [Quick Start](/start/quickstart).

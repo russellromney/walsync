@@ -1,0 +1,15 @@
+{
+  "name": "walsync-docs",
+  "version": "0.2.0",
+  "description": "Walsync documentation site",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.18.0",
+    "astro": "^4.1.0"
+  }
+}
