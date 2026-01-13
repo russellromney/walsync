@@ -18,7 +18,7 @@ What works now:
 - ✅ **Snapshots as LTX files** - Compressed, checksummed, Litestream-compatible
 - ✅ **Point-in-time restore** - By TXID or timestamp with manifest tracking
 - ✅ **Binary preservation** - Byte-for-byte identical restore verified
-- ✅ **Real S3 testing** - 76 tests including 16 integration tests on Tigris
+- ✅ **Real S3 testing** - 105 tests including 23 integration tests on Tigris
 - ✅ **Multi-database** - Single process handles multiple SQLite databases
 
 What's next:
@@ -189,7 +189,7 @@ snapshot_interval = "30m"  # Per-DB override
    - [x] WAL changes encoded as incremental LTX (not raw segments)
    - [x] Checksum chaining for LTX integrity verification
    - [x] In-place apply_ltx_to_db for efficient restore
-   - [x] Comprehensive tests (98 total, all passing)
+   - [x] Comprehensive tests (105 total, all passing)
 
 ---
 

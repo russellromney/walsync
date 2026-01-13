@@ -229,8 +229,14 @@ After release, update:
 
 ---
 
-**Current Version**: 0.2.0
-- ✅ SHA256 checksums
-- ✅ Multi-database support
-- ✅ Data integrity tests
+**Current Version**: 0.3.0
+- ✅ LTX format (Litestream-compatible) with SHA256 verification
+- ✅ Point-in-time restore by TXID or timestamp
+- ✅ GFS retention policies (grandfather/father/son compaction)
+- ✅ Config file support (TOML) with per-database overrides
+- ✅ Poll-based read replicas (`walsync replicate`)
+- ✅ `walsync explain` - Preview configuration without running
+- ✅ `walsync verify` - Verify LTX integrity in S3
+- ✅ Prometheus metrics dashboard
+- ✅ Multi-database support (single process)
 - ✅ Python bindings

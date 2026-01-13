@@ -204,6 +204,31 @@ impl Config {
 
     /// Validate configuration
     fn validate(&self) -> Result<()> {
+        // Validate global retention policy
+        if self.retention.hourly == 0
+            && self.retention.daily == 0
+            && self.retention.weekly == 0
+            && self.retention.monthly == 0
+        {
+            return Err(anyhow!(
+                "[retention]: at least one tier must be > 0"
+            ));
+        }
+
+        // Validate S3 bucket format if specified
+        if let Some(ref bucket) = self.s3.bucket {
+            if bucket.is_empty() {
+                return Err(anyhow!("[s3].bucket cannot be empty string"));
+            }
+            // Bucket should not contain spaces or invalid characters
+            if bucket.contains(' ') {
+                return Err(anyhow!(
+                    "[s3].bucket cannot contain spaces: '{}'",
+                    bucket
+                ));
+            }
+        }
+
         for (i, db) in self.databases.iter().enumerate() {
             if db.path.is_empty() {
                 return Err(anyhow!("databases[{}].path cannot be empty", i));
@@ -482,5 +507,91 @@ mod tests {
     fn test_expand_glob_literal_nonexistent() {
         let result = expand_glob("/nonexistent/path/to/database.db");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validation_global_zero_retention() {
+        // Global retention with all zeros should fail validation
+        let toml = r#"
+            [retention]
+            hourly = 0
+            daily = 0
+            weekly = 0
+            monthly = 0
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("[retention]"));
+    }
+
+    #[test]
+    fn test_validation_empty_bucket_string() {
+        let toml = r#"
+            [s3]
+            bucket = ""
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bucket"));
+    }
+
+    #[test]
+    fn test_validation_bucket_with_spaces() {
+        let toml = r#"
+            [s3]
+            bucket = "s3://my bucket/prefix"
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("spaces"));
+    }
+
+    #[test]
+    fn test_validation_valid_config() {
+        let toml = r#"
+            [s3]
+            bucket = "s3://valid-bucket/prefix"
+            endpoint = "https://fly.storage.tigris.dev"
+
+            [retention]
+            hourly = 24
+            daily = 7
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_partial_retention_ok() {
+        // Having just one retention tier > 0 should be valid
+        let toml = r#"
+            [retention]
+            hourly = 1
+            daily = 0
+            weekly = 0
+            monthly = 0
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 }

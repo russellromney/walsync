@@ -4296,4 +4296,109 @@ mod tests {
             assert_eq!(header.page_size.into_inner(), page_size);
         }
     }
+
+    // ============================================
+    // Explain Command Tests
+    // ============================================
+
+    #[test]
+    fn test_explain_no_config() {
+        // Test explain with no config - should not panic
+        let result = explain(&None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_explain_with_config() {
+        use crate::config::{Config, S3Config, SyncConfig, RetentionConfig};
+
+        let config = Config {
+            s3: S3Config {
+                bucket: Some("s3://test-bucket/prefix".to_string()),
+                endpoint: Some("https://fly.storage.tigris.dev".to_string()),
+            },
+            sync: SyncConfig {
+                snapshot_interval: 1800,
+                max_changes: 100,
+                max_interval: 300,
+                on_idle: 60,
+                on_startup: true,
+                compact_after_snapshot: true,
+                compact_interval: 3600,
+            },
+            retention: RetentionConfig {
+                hourly: 12,
+                daily: 5,
+                weekly: 8,
+                monthly: 6,
+            },
+            databases: vec![], // Empty databases - explain should still work
+        };
+
+        let result = explain(&Some(config));
+        assert!(result.is_ok());
+    }
+
+    // ============================================
+    // Verify Command Integration Tests
+    // ============================================
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_verify_valid_database() {
+        // Test verify on a database with valid LTX files
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("verify-valid-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+
+        // Create some snapshots
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Verify should pass with no issues
+        let result = verify(db_name, &bucket, endpoint.as_deref(), false).await;
+        assert!(result.is_ok(), "Verify should succeed on valid database");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_verify_nonexistent_database() {
+        // Test verify on a database that doesn't exist
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+
+        // Verify a nonexistent database should fail gracefully
+        let result = verify("nonexistent-db-12345", &bucket, endpoint.as_deref(), false).await;
+        // This will fail because manifest doesn't exist - that's expected
+        assert!(result.is_err(), "Verify should fail for nonexistent database");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_verify_multiple_snapshots() {
+        // Test verify on a database with multiple snapshots
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("verify-multi-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+
+        // Create multiple snapshots
+        for _ in 0..3 {
+            snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        }
+
+        // Verify should check all LTX files
+        let result = verify(db_name, &bucket, endpoint.as_deref(), false).await;
+        assert!(result.is_ok(), "Verify should succeed with multiple snapshots");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+    }
 }

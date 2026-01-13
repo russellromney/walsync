@@ -15,7 +15,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "walsync")]
-#[command(about = "Lightweight SQLite WAL sync to S3/Tigris")]
+#[command(version)]
+#[command(about = "Lightweight SQLite WAL sync to S3/Tigris with data integrity verification")]
+#[command(long_about = "Walsync provides production-grade SQLite database backup and replication \
+to S3-compatible storage. Features include point-in-time recovery, GFS retention policies, \
+Litestream-compatible LTX format, and multi-database support in a single process.")]
 struct Cli {
     /// Config file path (checks ./walsync.toml if not specified)
     #[arg(long, global = true)]
@@ -192,10 +196,16 @@ enum Commands {
         endpoint: Option<String>,
     },
 
-    /// Explain what the current configuration will do (dry-run preview)
+    /// Show what the current configuration will do without executing
+    ///
+    /// Displays a summary of: S3 storage settings, snapshot triggers, compaction policy,
+    /// retention tiers, and resolved database paths with any per-database overrides.
     Explain,
 
-    /// Verify integrity of LTX files in S3
+    /// Verify integrity of backed-up LTX files in S3
+    ///
+    /// Checks that each LTX file exists, has valid checksums, and maintains
+    /// TXID continuity. Use --fix to remove orphaned manifest entries.
     Verify {
         /// Database name (as registered in S3)
         name: String,
