@@ -7,52 +7,22 @@ description: How Walsync compares to Litestream and other SQLite sync tools
 
 Walsync was inspired by [Litestream](https://litestream.io/), the excellent SQLite replication tool. While Litestream pioneered WAL-based replication, Walsync addresses key scalability challenges for multi-database deployments.
 
-## The Problem with One-Process-Per-Database
+## Memory Efficiency at Scale
 
-Litestream follows a one-process-per-database model. This works great for single-database applications, but creates significant overhead when you need to sync many databases:
+Both Litestream (v0.5+) and Walsync support multi-database sync from a single process. Walsync's Rust implementation has a smaller memory footprint:
 
-| Databases | Litestream Processes | Memory Overhead |
-|-----------|---------------------|-----------------|
-| 1 | 1 | ~50MB |
-| 5 | 5 | ~250MB |
-| 10 | 10 | ~500MB |
-| 100 | 100 | ~5GB |
+- **Walsync:** ~12 MB baseline (constant regardless of database count)
+- **Litestream:** ~33 MB baseline
 
-Each Litestream process maintains its own:
-- S3 client and connection pool
-- WAL monitoring thread
-- Configuration state
-- Memory buffers
+For resource-constrained environments (512MB VMs, containers, edge deployments), this 21 MB difference matters. See [benchmarks](/concepts/benchmarks/) for detailed measurements.
 
 ## Walsync's Multi-Database Architecture
 
-Walsync uses a single process to sync multiple databases:
-
-| Databases | Walsync Processes | Memory Overhead |
-|-----------|------------------|-----------------|
-| 1 | 1 | ~30MB |
-| 5 | 1 | ~35MB |
-| 10 | 1 | ~40MB |
-| 100 | 1 | ~80MB |
-
-One process handles:
+A single Walsync process handles:
 - Shared S3 client with connection pooling
 - Efficient file watching across all databases
 - Consolidated configuration
 - Minimal per-database overhead
-
-## Feature Comparison
-
-| Feature | Litestream | Walsync |
-|---------|------------|---------|
-| WAL replication | Yes | Yes |
-| Point-in-time recovery | Yes | Yes |
-| S3-compatible storage | Yes | Yes |
-| Multi-database (single process) | No | Yes |
-| Data integrity verification | No | Yes (SHA256) |
-| Memory efficiency | Good | Excellent |
-| Rust implementation | No (Go) | Yes |
-| Python bindings | No | Yes |
 
 ## When to Use Walsync
 

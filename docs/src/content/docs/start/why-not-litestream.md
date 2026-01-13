@@ -5,7 +5,7 @@ description: When to use walsync vs Litestream
 
 ## Litestream is Awesome
 
-[Litestream](https://litestream.io) is an excellent tool for SQLite replication. Walsync is heavily inspired by Litestream's approach to WAL streaming and uses the same LTX file format for compatibility.
+[Litestream](https://litestream.io) is an excellent tool for SQLite replication, created by [Ben Johnson](https://github.com/benbjohnson). Walsync wouldn't exist without Litestream's pioneering work on WAL-based replication to S3. We use the same [LTX file format](https://github.com/superfly/ltx) for compatibility and are grateful for the open-source foundation that makes projects like this possible.
 
 **Use Litestream when:**
 - Battle-tested production stability is critical
@@ -18,14 +18,7 @@ Walsync was built for **resource-constrained environments** and **Rust-native de
 
 ### Memory Efficiency
 
-Walsync's Rust implementation has a smaller memory footprint:
-
-| Databases | Litestream | Walsync | Savings |
-|-----------|-----------|---------|---------|
-| 1 | ~33 MB | ~12 MB | 21 MB |
-| 10 | ~35 MB | ~12 MB | 23 MB |
-
-*Note: Litestream v0.5+ supports multi-database in a single process.*
+Walsync's Rust implementation has a smaller memory footprint (~12 MB vs ~33 MB baseline). For resource-constrained environments (small VMs, containers, edge deployments), this difference matters.
 
 ### Native Rust Integration
 
@@ -56,21 +49,6 @@ Walsync includes built-in read replica support:
 # Create a read replica that polls for updates
 walsync replicate s3://bucket/mydb --local replica.db --interval 5s
 ```
-
-## Feature Comparison
-
-| Feature | Litestream | Walsync |
-|---------|-----------|---------|
-| WAL streaming | Yes | Yes |
-| S3/compatible storage | Yes | Yes |
-| Point-in-time restore | Yes | Yes |
-| Multi-database | Yes (v0.5+) | Yes |
-| LTX format | Yes | Yes (compatible) |
-| Read replicas | Via restore | Built-in polling |
-| Compression | LZ4 | LZ4 |
-| Language | Go | Rust |
-| Memory footprint | ~33 MB | ~12 MB |
-| Maturity | Production-proven | Alpha |
 
 ## The Right Tool
 

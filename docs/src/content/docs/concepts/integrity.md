@@ -78,14 +78,6 @@ walsync verify mydb.db --bucket my-bucket
 # ✓ All checksums valid
 ```
 
-### Listing with Checksums
-
-```bash
-walsync list --bucket my-bucket --checksums
-# mydb.db  2024-01-15 10:30:00  a3f2b9c8d4e5f6a7...
-# users.db 2024-01-15 10:31:00  b4c3d2e1f0a9b8c7...
-```
-
 ## Why SHA256?
 
 - **Cryptographic strength** - Computationally infeasible to find collisions

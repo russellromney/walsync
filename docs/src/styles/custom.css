@@ -35,3 +35,20 @@
 starlight-toc {
   background: var(--sl-color-bg-sidebar);
 }
+
+/* Fix content width and padding for proper text wrapping */
+.main-frame {
+  padding-inline: 1rem;
+}
+
+@media (min-width: 50rem) {
+  .main-frame {
+    padding-inline: 2rem;
+  }
+}
+
+/* Ensure main content has proper max-width */
+.sl-container {
+  max-width: 82rem;
+  margin-inline: auto;
+}

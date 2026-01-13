@@ -12,7 +12,7 @@ One of Walsync's key advantages is efficiently syncing multiple SQLite databases
 Create a `walsync.toml` to define multiple databases:
 
 ```toml
-[storage]
+[s3]
 bucket = "my-bucket"
 endpoint = "https://fly.storage.tigris.dev"
 
@@ -119,11 +119,13 @@ prefix = "edge/node-1/sessions"
 Restore any single database without affecting others:
 
 ```bash
-walsync restore --prefix orders -o /data/orders-restored.db
+walsync restore orders -o /data/orders-restored.db -b my-bucket
 ```
 
-Or restore all databases:
+To restore multiple databases, run restore for each:
 
 ```bash
-walsync restore-all --config walsync.toml --output-dir /data/restored/
+walsync restore users -o /data/users-restored.db -b my-bucket
+walsync restore orders -o /data/orders-restored.db -b my-bucket
+walsync restore analytics -o /data/analytics-restored.db -b my-bucket
 ```

@@ -20,6 +20,16 @@ Commands:
   help       Print help for a command
 ```
 
+### Global Options
+
+These options apply to all commands:
+
+| Option | Description |
+|--------|-------------|
+| `--config <PATH>` | Path to config file (default: `./walsync.toml` if exists) |
+| `--version` | Print version |
+| `-h, --help` | Print help |
+
 ---
 
 ## snapshot
@@ -91,12 +101,18 @@ walsync watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 | `-b, --bucket <BUCKET>` | S3 bucket (required) |
 | `--snapshot-interval <SECONDS>` | Full snapshot interval in seconds (default: 3600 = 1 hour) |
 | `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
+| `--max-changes <N>` | Take snapshot after N WAL frames (0 = disabled) |
+| `--max-interval <SECONDS>` | Maximum seconds between snapshots when changes detected |
+| `--on-idle <SECONDS>` | Take snapshot after N seconds of no WAL activity (0 = disabled) |
+| `--on-startup <true\|false>` | Take snapshot immediately on watch start |
 | `--compact-after-snapshot` | Run compaction after each snapshot |
 | `--compact-interval <SECONDS>` | Compaction interval in seconds (0 = disabled) |
 | `--retain-hourly <N>` | Hourly snapshots to retain (default: 24) |
 | `--retain-daily <N>` | Daily snapshots to retain (default: 7) |
 | `--retain-weekly <N>` | Weekly snapshots to retain (default: 12) |
 | `--retain-monthly <N>` | Monthly snapshots to retain (default: 12) |
+| `--metrics-port <PORT>` | Prometheus metrics port (default: 16767) |
+| `--no-metrics` | Disable metrics server |
 | `-h, --help` | Print help |
 
 ### Examples
@@ -609,7 +625,7 @@ Walsync reads these environment variables:
 | `AWS_ACCESS_KEY_ID` | AWS/S3 access key |
 | `AWS_SECRET_ACCESS_KEY` | AWS/S3 secret key |
 | `AWS_ENDPOINT_URL_S3` | S3 endpoint URL (for Tigris, MinIO, etc.) |
-| `AWS_REGION` | AWS region (optional, defaults to `auto`) |
+| `AWS_REGION` | AWS region (optional, defaults to `us-east-1`) |
 
 ### Example Setup
 
@@ -637,8 +653,4 @@ export AWS_ENDPOINT_URL_S3=http://localhost:9000
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | General error |
-| 2 | Invalid arguments |
-| 3 | S3 connection error |
-| 4 | Database error |
-| 5 | Checksum verification failed |
+| 1 | Error (any failure) |

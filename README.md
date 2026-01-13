@@ -4,14 +4,11 @@
 
 # walsync
 
-**Lightweight SQLite WAL sync to S3/Tigris with explicit data integrity verification.**
+**Lightweight SQLite replication to S3/Tigris in Rust.**
 
-Like Litestream but:
-- ✅ **Explicit SHA256 checksums** - Stored in S3 metadata, verified on restore
-- ✅ **Production-grade data integrity** - Byte-for-byte database reconstruction guaranteed
-- ✅ **Multi-database efficiency** - Single process handles N databases (vs N Litestream processes)
-- ✅ **~7MB binary** - Rust vs Go runtime overhead
-- ✅ **Minimal memory** - ~12MB RSS regardless of database count
+Like Litestream but with an emphasis on memory footprint and easy of configuration. 
+
+> This is alpha software. Do not use in production. 
 
 ## Installation
 
@@ -70,20 +67,23 @@ walsync compact mydb -b s3://my-bucket
 walsync compact mydb -b s3://my-bucket --force
 ```
 
+## Acknowledgments
+
+Walsync wouldn't exist without [Litestream](https://litestream.io) and the work of [Ben Johnson](https://github.com/benbjohnson). Litestream was the first place I saw WAL-based SQLite replication to cloud storage, and walsync uses the same [LTX file format](https://github.com/superfly/ltx) for efficient compaction and replication.
+
 ## How It Works
 
 ```
-Local:                          S3:
-app.db                          /app/snapshots/20240110120000.db
-app.db-wal  ────────────────►   /app/wal/00000001-20240110120001234.wal
-           (file watcher)       /app/wal/00000001-20240110120005678.wal
-                                /app/state.json
+Local:                          S3 (LTX format):
+app.db                          /app/00000001-00000001.ltx  (snapshot)
+app.db-wal  ────────────────►   /app/00000002-00000010.ltx  (incremental)
+           (file watcher)       /app/manifest.json
 ```
 
 1. **Watch** - Monitor WAL files for changes (inotify/kqueue)
-2. **Sync** - Upload new WAL frames to S3 incrementally
+2. **Sync** - Upload new WAL frames as LTX files to S3
 3. **Snapshot** - Periodic full database snapshots (configurable interval)
-4. **Restore** - Download snapshot + replay WAL segments
+4. **Restore** - Download snapshot + apply incremental LTX files
 
 ## Commands
 
@@ -190,19 +190,15 @@ Checks: file existence, header validity, checksums, TXID continuity.
 - `AWS_ENDPOINT_URL_S3` - S3 endpoint (for Tigris/MinIO)
 - `AWS_REGION` - AWS region (default: us-east-1)
 
-## S3 Layout
+## S3 Layout (LTX Format)
 
 ```
 s3://bucket/prefix/
 ├── dbname/
-│   ├── snapshots/
-│   │   ├── 20240110120000.db
-│   │   └── 20240110130000.db
-│   ├── wal/
-│   │   ├── 00000001-20240110120001234.wal
-│   │   ├── 00000001-20240110120005678.wal
-│   │   └── ...
-│   └── state.json
+│   ├── 00000001-00000001.ltx     # Snapshot (TXID 1)
+│   ├── 00000002-00000010.ltx     # Incremental (TXID 2-10)
+│   ├── 00000011-00000050.ltx     # Incremental (TXID 11-50)
+│   └── manifest.json             # Index of LTX files
 └── otherdb/
     └── ...
 ```
@@ -219,7 +215,6 @@ Every snapshot includes an SHA256 checksum stored in S3 object metadata (`x-amz-
 ✓ Works with existing backups (optional)
 ```
 
-See [DATA_INTEGRITY.md](DATA_INTEGRITY.md) for complete testing details.
 
 ### Snapshot Compaction
 
@@ -261,7 +256,7 @@ Single walsync process handles multiple databases with shared S3 connection pool
 
 ## Testing
 
-32 comprehensive tests covering:
+105 tests covering:
 - ✅ Byte-for-byte data integrity (snapshot → restore → verify)
 - ✅ SHA256 checksum storage and verification
 - ✅ Multi-database concurrent snapshots
@@ -288,10 +283,9 @@ All databases sync with single process, saving ~275MB memory vs Litestream for 1
 
 ## Documentation
 
+- [Docs Site](https://walsync.dev) - Full documentation
 - [ROADMAP.md](ROADMAP.md) - Planned features and direction
 - [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Performance benchmark results
-- [CHECKSUM_STRATEGY.md](CHECKSUM_STRATEGY.md) - SHA256 implementation strategy
-- [DATA_INTEGRITY.md](DATA_INTEGRITY.md) - Data integrity guarantees and testing
 - [TESTING.md](TESTING.md) - Comprehensive testing guide
 - [bench/](bench/) - Performance benchmarks (micro, comparison, real-world)
 

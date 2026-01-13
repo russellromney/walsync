@@ -82,13 +82,11 @@ walsync watch mydb.db -b s3://my-bucket \
 ### Sync Triggers
 ```toml
 [sync]
-max_changes = 100      # Sync after N WAL frames
-max_interval = "10s"   # Or after N seconds (whichever first)
-
-[snapshots]
-interval = "1h"        # Full snapshot every hour
-on_idle = "5m"         # Or after 5 min idle
-on_startup = true      # Snapshot when watch starts
+snapshot_interval = 3600  # Full snapshot every hour (seconds)
+max_changes = 100         # Sync after N WAL frames
+max_interval = 600        # Or after N seconds (whichever first)
+on_idle = 300             # Snapshot after 5 min idle (seconds, 0 = disabled)
+on_startup = true         # Snapshot when watch starts
 ```
 
 ### Retention (Grandfather/Father/Son)
@@ -144,7 +142,7 @@ prefix = "tenant"
 [[databases]]
 path = "/data/app.db"
 prefix = "app"
-snapshot_interval = "30m"  # Per-DB override
+snapshot_interval = 1800  # Per-DB override (seconds)
 ```
 
 ### Data Integrity
@@ -166,17 +164,17 @@ snapshot_interval = "30m"  # Per-DB override
    - [x] Add auto-compact flags to `watch` command
    - [x] Write comprehensive unit and integration tests
 
-2. **Config File Support** (multi-DB usability)
-   - [ ] TOML config parsing with `serde`
-   - [ ] Per-database settings (prefix, snapshot_interval, retention)
-   - [ ] Wildcard database paths (`/data/*.db`)
-   - [ ] Config validation and error reporting
+2. **Config File Support** ✅ COMPLETE
+   - [x] TOML config parsing with `serde`
+   - [x] Per-database settings (prefix, snapshot_interval, retention)
+   - [x] Wildcard database paths (`/data/*.db`)
+   - [x] Config validation and error reporting
 
-3. **Sync Triggers** (reduce snapshot frequency)
-   - [ ] `max_changes` - sync after N WAL frames
-   - [ ] `max_interval` - or after N seconds (whichever first)
-   - [ ] `on_idle` - snapshot after idle period
-   - [ ] `on_startup` - snapshot when watch starts
+3. **Sync Triggers** ✅ COMPLETE
+   - [x] `max_changes` - sync after N WAL frames
+   - [x] `max_interval` - or after N seconds (whichever first)
+   - [x] `on_idle` - snapshot after idle period
+   - [x] `on_startup` - snapshot when watch starts
 
 ### Priority 2 - Observability
 4. **Metrics** ✅ COMPLETE
@@ -194,6 +192,10 @@ snapshot_interval = "30m"  # Per-DB override
 ---
 
 ## Post-Alpha Features
+
+### CLI Improvements
+- [ ] **Structured exit codes** - Specific exit codes for different error types (S3, database, checksum, etc.)
+- [ ] **JSON logging** (maybe) - Structured log output for log aggregation systems
 
 ### Read Replicas (Poll-based) ✅ COMPLETE
 ```bash
@@ -273,7 +275,7 @@ s3://bucket/prefix/
   - [x] manifest.json tracking with TXID sequencing
   - [x] Point-in-time restore by TXID or timestamp
   - [x] Binary data preservation with extensive test coverage
-  - [x] 98 total tests (all passing)
+  - [x] 105 total tests (all passing)
 - [x] **Snapshot Compaction & Retention**
   - [x] GFS rotation (hourly/daily/weekly/monthly tiers)
   - [x] `walsync compact` command with dry-run default
