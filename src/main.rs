@@ -1,4 +1,5 @@
 mod config;
+mod dashboard;
 mod ltx;
 mod retention;
 mod s3;
@@ -81,6 +82,14 @@ enum Commands {
         /// Number of monthly snapshots to retain
         #[arg(long)]
         retain_monthly: Option<usize>,
+
+        /// Metrics server port (default: 16767, disable with --no-metrics)
+        #[arg(long, default_value = "16767")]
+        metrics_port: u16,
+
+        /// Disable metrics server
+        #[arg(long)]
+        no_metrics: bool,
     },
 
     /// Restore a database from S3
@@ -181,6 +190,8 @@ struct WatchArgs {
     retain_daily: Option<usize>,
     retain_weekly: Option<usize>,
     retain_monthly: Option<usize>,
+    metrics_port: u16,
+    no_metrics: bool,
 }
 
 /// Resolve watch configuration by merging config file with CLI args
@@ -351,6 +362,8 @@ async fn main() -> Result<()> {
             retain_daily,
             retain_weekly,
             retain_monthly,
+            metrics_port,
+            no_metrics,
         } => {
             let watch_args = WatchArgs {
                 databases,
@@ -367,6 +380,8 @@ async fn main() -> Result<()> {
                 retain_daily,
                 retain_weekly,
                 retain_monthly,
+                metrics_port,
+                no_metrics,
             };
 
             let (resolved_dbs, bucket, endpoint, sync_config, retention_config) =
@@ -390,6 +405,8 @@ async fn main() -> Result<()> {
                 endpoint.as_deref(),
                 sync_config,
                 compact_policy,
+                watch_args.metrics_port,
+                watch_args.no_metrics,
             )
             .await?;
         }

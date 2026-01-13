@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::config::{ResolvedDbConfig, SyncConfig};
+use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
@@ -289,9 +290,20 @@ pub async fn watch_with_config(
     endpoint: Option<&str>,
     global_sync: SyncConfig,
     compact_policy: Option<RetentionPolicy>,
+    metrics_port: u16,
+    no_metrics: bool,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
+
+    // Set up metrics server (unless disabled)
+    let metrics_state = Arc::new(MetricsState::new());
+    if !no_metrics {
+        let state_clone = Arc::clone(&metrics_state);
+        tokio::spawn(async move {
+            dashboard::start_server(metrics_port, state_clone).await;
+        });
+    }
 
     // Initialize state for each database
     let mut db_states: HashMap<PathBuf, DbState> = HashMap::new();
@@ -370,6 +382,24 @@ pub async fn watch_with_config(
 
         trigger_states.insert(db_path.clone(), TriggerState::default());
         sync_configs.insert(db_path.clone(), db_config.sync.clone());
+
+        // Update dashboard with initial state
+        let wal_size = std::fs::metadata(&db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        metrics_state
+            .update_db(DbStatus {
+                name: db_config.prefix.clone(),
+                path: db_path.display().to_string(),
+                last_sync_timestamp: 0,
+                wal_size_bytes: wal_size,
+                next_snapshot_timestamp: chrono::Utc::now().timestamp()
+                    + global_sync.snapshot_interval as i64,
+                error_count: 0,
+                snapshot_count: 0,
+                current_txid,
+            })
+            .await;
     }
 
     // Set up file watcher
@@ -482,6 +512,19 @@ pub async fn watch_with_config(
 
                     match sync_wal(&client, &bucket_name, &prefix, state).await {
                         Ok(frame_count) if frame_count > 0 => {
+                            // Update dashboard on successful sync
+                            let wal_size = std::fs::metadata(&state.wal_path).map(|m| m.len()).unwrap_or(0);
+                            metrics_state.update_db(DbStatus {
+                                name: state.name.clone(),
+                                path: state.db_path.display().to_string(),
+                                last_sync_timestamp: chrono::Utc::now().timestamp(),
+                                wal_size_bytes: wal_size,
+                                next_snapshot_timestamp: state.last_snapshot.map(|t| t.timestamp() + global_sync.snapshot_interval as i64).unwrap_or(0),
+                                error_count: 0,
+                                snapshot_count: 0,
+                                current_txid: state.current_txid,
+                            }).await;
+
                             if let Some(trigger) = trigger_states.get_mut(&db_path) {
                                 trigger.frames_since_snapshot += frame_count;
                                 trigger.last_wal_activity = Some(std::time::Instant::now());
@@ -500,7 +543,9 @@ pub async fn watch_with_config(
                                     );
                                     if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
                                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                                        metrics_state.record_error(&state.name);
                                     } else {
+                                        metrics_state.record_snapshot(&state.name);
                                         trigger.frames_since_snapshot = 0;
                                         trigger.first_change_time = None;
 
@@ -514,7 +559,10 @@ pub async fn watch_with_config(
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => tracing::error!("Failed to sync WAL for {}: {}", state.name, e),
+                        Err(e) => {
+                            tracing::error!("Failed to sync WAL for {}: {}", state.name, e);
+                            metrics_state.record_error(&state.name);
+                        }
                     }
                 }
             }
@@ -571,7 +619,9 @@ pub async fn watch_with_config(
 
                         if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                            metrics_state.record_error(&state.name);
                         } else {
+                            metrics_state.record_snapshot(&state.name);
                             trigger.frames_since_snapshot = 0;
                             trigger.first_change_time = None;
                             trigger.last_wal_activity = None;
@@ -591,7 +641,9 @@ pub async fn watch_with_config(
                 for (db_path, state) in db_states.iter_mut() {
                     if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                        metrics_state.record_error(&state.name);
                     } else {
+                        metrics_state.record_snapshot(&state.name);
                         // Reset trigger state after scheduled snapshot
                         if let Some(trigger) = trigger_states.get_mut(db_path) {
                             trigger.frames_since_snapshot = 0;

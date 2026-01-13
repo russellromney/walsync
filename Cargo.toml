@@ -53,10 +53,15 @@ sha2 = "0.10"
 # LTX format (Litestream-compatible)
 litetx = "0.1"
 
+# Dashboard + metrics
+axum = "0.7"
+prometheus = "0.13"
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tempfile = "3"
+tower = "0.5"
 
 [[bench]]
 name = "benchmarks"

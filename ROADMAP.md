@@ -23,9 +23,9 @@ What works now:
 
 What's next:
 - ✅ **Compaction & retention** - GFS rotation with configurable retention
-- ⏳ Config file support for multi-DB deployments
-- ⏳ Smart sync triggers (reduce snapshot frequency)
-- ⏳ Dashboard & metrics for observability
+- ✅ **Config file support** for multi-DB deployments
+- ✅ **Smart sync triggers** (reduce snapshot frequency)
+- ✅ **Dashboard & metrics** for observability
 
 ---
 
@@ -127,10 +127,10 @@ Snapshot age >= 12 weeks → Monthly tier  (keep 12)
 - `src/sync.rs` - Add compact() orchestration
 - `src/main.rs` - Add Compact subcommand + watch flags
 
-### Dashboard + Metrics
-- Built-in web UI at `--dashboard-port 8080`
-- `/metrics` endpoint for Prometheus
-- Shows: databases, last sync, WAL size, next snapshot, errors
+### Metrics
+- Prometheus `/metrics` endpoint at `--metrics-port` (default: 16767)
+- Always on unless `--no-metrics`, localhost-only binding
+- Metrics: last_sync, wal_size, next_snapshot, error_count, snapshot_count, current_txid, uptime
 
 ### Multi-Database
 ```toml
@@ -176,10 +176,10 @@ snapshot_interval = "30m"  # Per-DB override
    - [ ] `on_startup` - snapshot when watch starts
 
 ### Priority 2 - Observability
-4. **Dashboard + Metrics**
-   - [ ] Basic web UI showing database status
-   - [ ] Prometheus `/metrics` endpoint
-   - [ ] Key metrics: last_sync, wal_size, next_snapshot, error_count
+4. **Metrics** ✅ COMPLETE
+   - [x] Prometheus `/metrics` endpoint at `--metrics-port` (default: 16767)
+   - [x] Localhost-only binding (127.0.0.1), graceful port conflict handling
+   - [x] Metrics: last_sync, wal_size, next_snapshot, error_count, snapshot_count, current_txid, uptime
 
 ### Priority 3 - Advanced Features
 5. **Incremental WAL as LTX** (future optimization)
