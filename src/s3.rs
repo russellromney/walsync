@@ -203,6 +203,83 @@ pub async fn get_checksum(client: &Client, bucket: &str, key: &str) -> Result<Op
     }
 }
 
+/// Delete a single object from S3
+pub async fn delete_object(client: &Client, bucket: &str, key: &str) -> Result<()> {
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    tracing::debug!("Deleted s3://{}/{}", bucket, key);
+    Ok(())
+}
+
+/// Delete multiple objects from S3 (batch operation)
+/// Uses DeleteObjects API for efficiency (up to 1000 objects per request)
+pub async fn delete_objects(client: &Client, bucket: &str, keys: &[String]) -> Result<usize> {
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+
+    if keys.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total_deleted = 0;
+
+    // DeleteObjects supports up to 1000 keys per request
+    for chunk in keys.chunks(1000) {
+        let objects: Vec<ObjectIdentifier> = chunk
+            .iter()
+            .filter_map(|key| ObjectIdentifier::builder().key(key).build().ok())
+            .collect();
+
+        if objects.is_empty() {
+            continue;
+        }
+
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(true) // Don't return individual results
+            .build()?;
+
+        let result = client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await?;
+
+        // Count errors if any
+        let error_count = result.errors().len();
+        let deleted_count = chunk.len() - error_count;
+        total_deleted += deleted_count;
+
+        if error_count > 0 {
+            tracing::warn!(
+                "Failed to delete {} objects from s3://{}/",
+                error_count,
+                bucket
+            );
+            for err in result.errors() {
+                tracing::debug!(
+                    "Delete error: {} - {}",
+                    err.key().unwrap_or("unknown"),
+                    err.message().unwrap_or("unknown error")
+                );
+            }
+        }
+
+        tracing::debug!(
+            "Deleted {} objects from s3://{}/",
+            deleted_count,
+            bucket
+        );
+    }
+
+    Ok(total_deleted)
+}
+
 /// Check if object exists
 #[allow(dead_code)]
 pub async fn exists(client: &Client, bucket: &str, key: &str) -> Result<bool> {

@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::ltx;
+use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::wal;
 
@@ -66,6 +67,9 @@ pub async fn watch(
     bucket: &str,
     snapshot_interval: u64,
     endpoint: Option<&str>,
+    compact_after_snapshot: bool,
+    compact_interval: u64,
+    compact_policy: Option<RetentionPolicy>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
@@ -184,7 +188,30 @@ pub async fn watch(
     let snapshot_interval = Duration::from_secs(snapshot_interval);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
 
-    tracing::info!("walsync running (snapshot interval: {}s)", snapshot_interval.as_secs());
+    // Set up compaction timer (only if compact_interval > 0)
+    let compact_interval_duration = if compact_interval > 0 {
+        Duration::from_secs(compact_interval)
+    } else {
+        Duration::from_secs(u64::MAX) // Effectively disabled
+    };
+    let mut compact_timer = tokio::time::interval(compact_interval_duration);
+    // Skip the first immediate tick
+    compact_timer.tick().await;
+
+    if compact_after_snapshot {
+        tracing::info!(
+            "walsync running (snapshot interval: {}s, compact after snapshot: enabled)",
+            snapshot_interval.as_secs()
+        );
+    } else if compact_interval > 0 {
+        tracing::info!(
+            "walsync running (snapshot interval: {}s, compact interval: {}s)",
+            snapshot_interval.as_secs(),
+            compact_interval
+        );
+    } else {
+        tracing::info!("walsync running (snapshot interval: {}s)", snapshot_interval.as_secs());
+    }
 
     loop {
         tokio::select! {
@@ -206,12 +233,127 @@ pub async fn watch(
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
                     }
                 }
+
+                // Run compaction after snapshots if enabled
+                if compact_after_snapshot {
+                    if let Some(ref policy) = compact_policy {
+                        for state in db_states.values() {
+                            if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
+                                tracing::error!("Failed to compact {}: {}", state.name, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compaction timer (if enabled)
+            _ = compact_timer.tick(), if compact_interval > 0 => {
+                if let Some(ref policy) = compact_policy {
+                    for state in db_states.values() {
+                        if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
+                            tracing::error!("Failed to compact {}: {}", state.name, e);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-/// Sync WAL changes to S3 as incremental LTX files
+/// Internal compaction for watch mode (non-interactive, always force)
+async fn run_compaction(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    name: &str,
+    policy: &RetentionPolicy,
+) -> Result<()> {
+    // Load manifest to get snapshot info
+    let manifest = load_manifest(client, bucket, prefix, name).await?;
+
+    if manifest.files.is_empty() {
+        return Ok(());
+    }
+
+    // Filter to only snapshots (not incremental files)
+    let snapshot_entries: Vec<SnapshotEntry> = manifest
+        .files
+        .iter()
+        .filter(|f| f.is_snapshot)
+        .filter_map(|f| {
+            chrono::DateTime::parse_from_rfc3339(&f.created_at)
+                .ok()
+                .map(|dt| SnapshotEntry {
+                    filename: f.filename.clone(),
+                    created_at: dt.with_timezone(&Utc),
+                    max_txid: f.max_txid,
+                    size: f.size,
+                })
+        })
+        .collect();
+
+    if snapshot_entries.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    let plan = retention::analyze_retention(&snapshot_entries, policy, now);
+
+    if !plan.has_deletions() {
+        tracing::debug!("Compaction for {}: nothing to delete", name);
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Compacting {}: deleting {} snapshots, keeping {}",
+        name,
+        plan.delete.len(),
+        plan.keep.len()
+    );
+
+    // Delete files
+    let keys_to_delete: Vec<String> = plan
+        .delete
+        .iter()
+        .map(|e| format!("{}{}/{}", prefix, name, e.filename))
+        .collect();
+
+    let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete).await?;
+
+    // Update manifest to remove deleted entries
+    let kept_filenames: std::collections::HashSet<_> =
+        plan.keep.iter().map(|e| e.filename.as_str()).collect();
+
+    let updated_files: Vec<LtxEntry> = manifest
+        .files
+        .into_iter()
+        .filter(|f| !f.is_snapshot || kept_filenames.contains(f.filename.as_str()))
+        .collect();
+
+    let updated_manifest = Manifest {
+        files: updated_files,
+        ..manifest
+    };
+
+    save_manifest(client, bucket, prefix, &updated_manifest).await?;
+
+    tracing::info!(
+        "Compaction complete for {}: deleted {} snapshots, freed {:.2} MB",
+        name,
+        deleted_count,
+        plan.bytes_freed as f64 / (1024.0 * 1024.0)
+    );
+
+    Ok(())
+}
+
+/// Sync WAL changes to S3 as raw WAL segments
+///
+/// Note: We store WAL as raw segments rather than incremental LTX because:
+/// - LTX incremental files require sequential page numbers (WAL has arbitrary pages)
+/// - LTX incremental files require pre_apply_checksum chaining
+/// - Snapshots as LTX provide the main restore capability
+/// - Raw WAL segments can be replayed for point-in-time recovery
 async fn sync_wal(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -232,84 +374,37 @@ async fn sync_wal(
         state.wal_generation += 1;
     }
 
-    // Read and parse WAL frames into pages
-    let (frames, new_offset, max_db_size) =
-        wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
+    // Read WAL frames as raw bytes
+    let (frames, new_offset, frame_count) =
+        wal::read_frames_from(&state.wal_path, header.page_size, state.wal_offset).await?;
 
-    if frames.is_empty() {
+    if frame_count == 0 {
         return Ok(());
     }
 
+    // Upload raw WAL segment
     let timestamp = Utc::now();
-
-    // Convert frames to pages for LTX encoding
-    let pages: Vec<(u32, Vec<u8>)> = frames
-        .iter()
-        .map(|f| (f.page_number, f.data.clone()))
-        .collect();
-
-    // Determine commit page (last frame with non-zero db_size, or last page)
-    let commit_page = frames
-        .iter()
-        .rev()
-        .find(|f| f.db_size > 0)
-        .map(|f| f.db_size)
-        .unwrap_or(max_db_size.max(1));
-
-    // Calculate TXID range for this incremental
-    let min_txid = state.current_txid + 1;
-    let max_txid = min_txid + frames.len() as u64 - 1;
-
-    // Encode as incremental LTX
-    let mut ltx_buffer = Vec::new();
-    let _checksum = ltx::encode_wal_changes(
-        &mut ltx_buffer,
-        &pages,
-        header.page_size,
-        min_txid,
-        max_txid,
-        commit_page,
-        None, // pre_checksum (we could track this for chain verification)
-    )?;
-
-    let ltx_size = ltx_buffer.len() as u64;
-
-    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-    let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
-
-    // Upload LTX file
-    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
-
-    tracing::info!(
-        "{}: Synced {} WAL frames as LTX {} (TXID: {}-{}, size: {} bytes)",
+    let wal_key = format!(
+        "{}{}/wal/{:08}-{}.wal",
+        prefix,
         state.name,
-        frames.len(),
-        ltx_filename,
-        min_txid,
-        max_txid,
-        ltx_size
+        state.wal_generation,
+        timestamp.format("%Y%m%d%H%M%S%3f")
     );
 
-    // Update manifest
-    let mut manifest = load_manifest(client, bucket, prefix, &state.name).await?;
-    manifest.current_txid = max_txid;
-    manifest.page_size = header.page_size;
-    manifest.files.push(LtxEntry {
-        filename: ltx_filename,
-        min_txid,
-        max_txid,
-        size: ltx_size,
-        created_at: timestamp.to_rfc3339(),
-        is_snapshot: false,
-    });
-    save_manifest(client, bucket, prefix, &manifest).await?;
+    s3::upload_bytes(client, bucket, &wal_key, frames).await?;
 
-    // Update state
+    tracing::info!(
+        "{}: Synced {} WAL frames ({} -> {})",
+        state.name,
+        frame_count,
+        state.wal_offset,
+        new_offset
+    );
+
     state.wal_offset = new_offset;
-    state.current_txid = max_txid;
 
-    // Save legacy state for backwards compat
+    // Save state
     save_state(client, bucket, prefix, state).await?;
 
     Ok(())
@@ -665,6 +760,148 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Compact old snapshots using retention policy (GFS rotation)
+///
+/// Analyzes snapshots and deletes those that don't fit the retention policy.
+/// By default runs in dry-run mode (force=false) to show what would be deleted.
+pub async fn compact(
+    name: &str,
+    bucket: &str,
+    endpoint: Option<&str>,
+    policy: &RetentionPolicy,
+    force: bool,
+) -> Result<()> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint).await?;
+
+    // Load manifest to get snapshot info
+    let manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
+
+    if manifest.files.is_empty() {
+        println!("No snapshots found for database '{}'", name);
+        return Ok(());
+    }
+
+    // Filter to only snapshots (not incremental files)
+    let snapshot_entries: Vec<SnapshotEntry> = manifest
+        .files
+        .iter()
+        .filter(|f| f.is_snapshot)
+        .filter_map(|f| {
+            chrono::DateTime::parse_from_rfc3339(&f.created_at)
+                .ok()
+                .map(|dt| SnapshotEntry {
+                    filename: f.filename.clone(),
+                    created_at: dt.with_timezone(&Utc),
+                    max_txid: f.max_txid,
+                    size: f.size,
+                })
+        })
+        .collect();
+
+    if snapshot_entries.is_empty() {
+        println!("No snapshots found for database '{}'", name);
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    let plan = retention::analyze_retention(&snapshot_entries, policy, now);
+
+    // Print summary
+    println!("Compaction plan for '{}':", name);
+    println!("  {}", plan.summary());
+    println!();
+
+    if !plan.has_deletions() {
+        println!("Nothing to delete - all snapshots fit retention policy.");
+        return Ok(());
+    }
+
+    // Print what will be kept
+    println!("Keeping {} snapshots:", plan.keep.len());
+    for entry in &plan.keep {
+        println!(
+            "  {} (TXID: {}, {})",
+            entry.filename,
+            entry.max_txid,
+            format_age(now, entry.created_at)
+        );
+    }
+    println!();
+
+    // Print what will be deleted
+    println!("Deleting {} snapshots:", plan.delete.len());
+    for entry in &plan.delete {
+        println!(
+            "  {} (TXID: {}, {})",
+            entry.filename,
+            entry.max_txid,
+            format_age(now, entry.created_at)
+        );
+    }
+    println!();
+
+    if !force {
+        println!("Dry-run mode: no files deleted. Use --force to actually delete.");
+        return Ok(());
+    }
+
+    // Actually delete files
+    println!("Deleting files...");
+
+    let keys_to_delete: Vec<String> = plan
+        .delete
+        .iter()
+        .map(|e| format!("{}{}/{}", prefix, name, e.filename))
+        .collect();
+
+    let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete).await?;
+
+    tracing::info!("Deleted {} snapshot files", deleted_count);
+
+    // Update manifest to remove deleted entries
+    let kept_filenames: std::collections::HashSet<_> =
+        plan.keep.iter().map(|e| e.filename.as_str()).collect();
+
+    let updated_files: Vec<LtxEntry> = manifest
+        .files
+        .into_iter()
+        .filter(|f| !f.is_snapshot || kept_filenames.contains(f.filename.as_str()))
+        .collect();
+
+    let updated_manifest = Manifest {
+        files: updated_files,
+        ..manifest
+    };
+
+    save_manifest(&client, &bucket_name, &prefix, &updated_manifest).await?;
+
+    println!(
+        "Compaction complete: deleted {} snapshots, freed {:.2} MB",
+        deleted_count,
+        plan.bytes_freed as f64 / (1024.0 * 1024.0)
+    );
+
+    Ok(())
+}
+
+/// Format age of a snapshot in human-readable form
+fn format_age(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) -> String {
+    let age = now.signed_duration_since(created_at);
+
+    if age.num_hours() < 1 {
+        format!("{} min ago", age.num_minutes())
+    } else if age.num_hours() < 24 {
+        format!("{} hours ago", age.num_hours())
+    } else if age.num_days() < 7 {
+        format!("{} days ago", age.num_days())
+    } else if age.num_weeks() < 12 {
+        format!("{} weeks ago", age.num_weeks())
+    } else {
+        format!("{} months ago", age.num_days() / 30)
+    }
+}
+
 /// Compute SHA256 hash of file for integrity verification
 async fn compute_file_sha256(path: &Path) -> Result<String> {
     use std::io::Read;
@@ -762,13 +999,33 @@ mod tests {
         std::env::var("AWS_ENDPOINT_URL_S3").ok()
     }
 
-    /// Helper to create a test database
+    /// Helper to create a test database with valid SQLite structure
     async fn create_test_db(name: &str) -> PathBuf {
         let path = PathBuf::from(format!("/tmp/walsync-test-{}.db", name));
-        // Create a minimal SQLite database with WAL mode
-        let db_path = path.clone();
-        tokio::fs::write(&db_path, b"SQLite format 3\0").await.ok();
-        db_path
+        let page_size = 4096u32;
+
+        // Create a minimal valid SQLite database (1 page)
+        let mut db_data = vec![0u8; page_size as usize];
+        // SQLite header magic
+        db_data[0..16].copy_from_slice(b"SQLite format 3\0");
+        // Page size at offset 16-17 (big-endian)
+        db_data[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        // File format versions
+        db_data[18] = 1;
+        db_data[19] = 1;
+        // Reserved space
+        db_data[20] = 0;
+        // Max/min payload fractions
+        db_data[21] = 64;
+        db_data[22] = 32;
+        db_data[23] = 32;
+        // File change counter
+        db_data[24..28].copy_from_slice(&1u32.to_be_bytes());
+        // Database size in pages
+        db_data[28..32].copy_from_slice(&1u32.to_be_bytes());
+
+        tokio::fs::write(&path, &db_data).await.ok();
+        path
     }
 
     /// Helper to create a test WAL file
@@ -951,15 +1208,45 @@ mod tests {
         let db_name = db_path.file_stem().unwrap().to_str().unwrap();
         let restored_path = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
 
-        // Create database with varied content (not just magic bytes)
-        let original_data = vec![
-            b"SQLite format 3\0".to_vec(),
-            // Add varying byte patterns
-            (0u8..=255u8).collect::<Vec<_>>(),
-            vec![0xFF; 256],
-            b"This is test data".to_vec(),
-            vec![0x42; 512], // BBBB...
-        ].concat();
+        // Create a valid SQLite-structured database with varied binary content
+        // Must have: valid header, page_size at bytes 16-17, and be page-aligned
+        let page_size = 4096u32;
+        let num_pages = 3; // 3 pages = 12KB database
+        let mut original_data = vec![0u8; (page_size as usize) * num_pages];
+
+        // Page 1: Valid SQLite header with varied content
+        original_data[0..16].copy_from_slice(b"SQLite format 3\0");
+        original_data[16..18].copy_from_slice(&(page_size as u16).to_be_bytes()); // Page size
+        original_data[18] = 1; // File format write version
+        original_data[19] = 1; // File format read version
+        original_data[20] = 0; // Reserved space
+        original_data[21] = 64; // Max payload fraction
+        original_data[22] = 32; // Min payload fraction
+        original_data[23] = 32; // Leaf payload fraction
+        original_data[24..28].copy_from_slice(&1u32.to_be_bytes()); // File change counter
+        original_data[28..32].copy_from_slice(&(num_pages as u32).to_be_bytes()); // DB size in pages
+
+        // Fill rest of page 1 with varied byte patterns
+        for i in 100..page_size as usize {
+            original_data[i] = (i % 256) as u8;
+        }
+
+        // Page 2: All byte values 0x00-0xFF repeated
+        let page2_start = page_size as usize;
+        for i in 0..page_size as usize {
+            original_data[page2_start + i] = (i % 256) as u8;
+        }
+
+        // Page 3: Mix of patterns including 0xFF and custom data
+        let page3_start = (page_size * 2) as usize;
+        for i in 0..1024 {
+            original_data[page3_start + i] = 0xFF; // First 1KB = 0xFF
+        }
+        let test_msg = b"This is test data for binary preservation verification!";
+        original_data[page3_start + 1024..page3_start + 1024 + test_msg.len()].copy_from_slice(test_msg);
+        for i in (page3_start + 2048)..(page_size * 3) as usize {
+            original_data[i] = 0x42; // Fill rest with 'B'
+        }
 
         tokio::fs::write(&db_path, &original_data).await.unwrap();
 
@@ -1058,6 +1345,147 @@ mod tests {
         tokio::fs::remove_file(&restored_path).await.ok();
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_manifest_updates() {
+        // Test that manifest is properly created and updated across snapshots
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("manifest-test-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+
+        // First snapshot
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Second snapshot (should increment TXID)
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Third snapshot
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Verify manifest has 3 entries (we can't directly check without downloading,
+        // but restore should succeed with latest TXID)
+        let restored_path = PathBuf::from(format!("/tmp/restored-manifest-{}.db", uuid::Uuid::new_v4()));
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        assert!(restore_result.is_ok(), "Restore should find latest snapshot from manifest");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+        tokio::fs::remove_file(&restored_path).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_point_in_time_restore_by_txid() {
+        // Test point-in-time restore using TXID
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("pit-txid-test-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+
+        // Create multiple snapshots
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap(); // TXID 1
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Modify DB content slightly
+        let mut data = tokio::fs::read(&db_path).await.unwrap();
+        data.extend(vec![0xAA; 100]);
+        tokio::fs::write(&db_path, &data).await.unwrap();
+
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap(); // TXID 2
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Restore to TXID 1 (first snapshot)
+        let restored_path = PathBuf::from(format!("/tmp/restored-pit-{}.db", uuid::Uuid::new_v4()));
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), Some("1")).await;
+        assert!(restore_result.is_ok(), "Point-in-time restore by TXID should succeed");
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+        tokio::fs::remove_file(&restored_path).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_ltx_file_naming() {
+        // Test that LTX files are created with correct naming convention
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("ltx-naming-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+
+        // Snapshot creates LTX file: 00000001-{txid}.ltx
+        snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // List should work and show the database
+        let list_result = list(&bucket, endpoint.as_deref()).await;
+        assert!(list_result.is_ok());
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_sqlite_like_database() {
+        // Test with a database that has SQLite-like structure
+        use tempfile::tempdir;
+
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(format!("sqlite-like-{}.db", uuid::Uuid::new_v4()));
+        let db_name = db_path.file_stem().unwrap().to_str().unwrap();
+        let restored_path = dir.path().join("restored.db");
+
+        let page_size = 4096u32;
+
+        // Create a database with valid SQLite header structure
+        let mut db_data = vec![0u8; page_size as usize * 3]; // 3 pages
+        // SQLite header magic
+        db_data[0..16].copy_from_slice(b"SQLite format 3\0");
+        // Page size at offset 16-17 (big-endian)
+        db_data[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        // File format versions
+        db_data[18] = 1;
+        db_data[19] = 1;
+        // Database file change counter
+        db_data[24..28].copy_from_slice(&1u32.to_be_bytes());
+        // Schema version
+        db_data[40..44].copy_from_slice(&1u32.to_be_bytes());
+        // Add some varied content in remaining pages
+        for i in page_size as usize..db_data.len() {
+            db_data[i] = ((i * 17) % 256) as u8;
+        }
+
+        tokio::fs::write(&db_path, &db_data).await.unwrap();
+
+        let original_hash = compute_sha256(&db_data);
+
+        // Snapshot
+        let snapshot_result = snapshot(&db_path, &bucket, endpoint.as_deref()).await;
+        assert!(snapshot_result.is_ok(), "Snapshot of SQLite-like DB should succeed");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Restore
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        assert!(restore_result.is_ok(), "Restore should succeed");
+
+        // Verify byte-for-byte match
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        let restored_hash = compute_sha256(&restored_data);
+
+        assert_eq!(original_hash, restored_hash, "Database should be byte-identical after restore");
+        assert_eq!(db_data, restored_data);
+    }
+
     #[test]
     fn test_performance_multi_database_advantage() {
         // This test documents the theoretical advantage of walsync vs Litestream
@@ -1087,5 +1515,1091 @@ mod tests {
 
         println!("\nNote: This is a theoretical advantage. Actual overhead depends on");
         println!("binary size, Tigris connection pooling, and WAL activity per database.\n");
+    }
+
+    // ============================================
+    // Manifest Tests
+    // ============================================
+
+    #[test]
+    fn test_manifest_serialization() {
+        let manifest = Manifest {
+            name: "testdb".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000050.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 50,
+                    size: 1024,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000051-00000100.ltx".to_string(),
+                    min_txid: 51,
+                    max_txid: 100,
+                    size: 512,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        // Serialize
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(json.contains("testdb"));
+        assert!(json.contains("00000001-00000050.ltx"));
+
+        // Deserialize
+        let parsed: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "testdb");
+        assert_eq!(parsed.current_txid, 100);
+        assert_eq!(parsed.files.len(), 2);
+        assert!(parsed.files[0].is_snapshot);
+        assert!(!parsed.files[1].is_snapshot);
+    }
+
+    #[test]
+    fn test_manifest_default() {
+        let manifest = Manifest::default();
+        assert_eq!(manifest.name, "");
+        assert_eq!(manifest.current_txid, 0);
+        assert_eq!(manifest.page_size, 0);
+        assert!(manifest.files.is_empty());
+    }
+
+    #[test]
+    fn test_ltx_entry_serialization() {
+        let entry = LtxEntry {
+            filename: "00000001-00000010.ltx".to_string(),
+            min_txid: 1,
+            max_txid: 10,
+            size: 8192,
+            created_at: "2024-06-15T12:30:45Z".to_string(),
+            is_snapshot: true,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: LtxEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.filename, entry.filename);
+        assert_eq!(parsed.min_txid, entry.min_txid);
+        assert_eq!(parsed.max_txid, entry.max_txid);
+        assert_eq!(parsed.size, entry.size);
+        assert_eq!(parsed.is_snapshot, entry.is_snapshot);
+    }
+
+    #[test]
+    fn test_ltx_filename_format() {
+        // Test the LTX filename format: {min_txid:08}-{max_txid:08}.ltx
+        let test_cases = vec![
+            (1, 1, "00000001-00000001.ltx"),
+            (1, 100, "00000001-00000100.ltx"),
+            (50, 150, "00000050-00000150.ltx"),
+            (1000000, 1000050, "01000000-01000050.ltx"),
+        ];
+
+        for (min_txid, max_txid, expected) in test_cases {
+            let filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+            assert_eq!(filename, expected);
+        }
+    }
+
+    #[test]
+    fn test_manifest_find_latest_snapshot() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000020.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 20,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000021-00000040.ltx".to_string(),
+                    min_txid: 21,
+                    max_txid: 40,
+                    size: 500,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                LtxEntry {
+                    filename: "00000001-00000060.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 60,
+                    size: 1500,
+                    created_at: "2024-01-01T02:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000061-00000100.ltx".to_string(),
+                    min_txid: 61,
+                    max_txid: 100,
+                    size: 600,
+                    created_at: "2024-01-01T03:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        // Find latest snapshot up to TXID 50
+        let target_txid = 50u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target_txid)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().max_txid, 20); // First snapshot
+
+        // Find latest snapshot up to TXID 100
+        let target_txid = 100u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target_txid)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().max_txid, 60); // Second snapshot
+    }
+
+    #[test]
+    fn test_manifest_find_incrementals_after_snapshot() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000050.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 50,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000051-00000070.ltx".to_string(),
+                    min_txid: 51,
+                    max_txid: 70,
+                    size: 500,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                LtxEntry {
+                    filename: "00000071-00000100.ltx".to_string(),
+                    min_txid: 71,
+                    max_txid: 100,
+                    size: 600,
+                    created_at: "2024-01-01T02:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        // Find incrementals after snapshot (max_txid=50) up to target (80)
+        let snapshot_max_txid = 50u64;
+        let target_txid = 80u64;
+
+        let incrementals: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| !f.is_snapshot && f.min_txid > snapshot_max_txid && f.max_txid <= target_txid)
+            .collect();
+
+        assert_eq!(incrementals.len(), 1);
+        assert_eq!(incrementals[0].filename, "00000051-00000070.ltx");
+
+        // Find incrementals up to TXID 100
+        let target_txid = 100u64;
+        let incrementals: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| !f.is_snapshot && f.min_txid > snapshot_max_txid && f.max_txid <= target_txid)
+            .collect();
+
+        assert_eq!(incrementals.len(), 2);
+    }
+
+    // ============================================
+    // Page Size Tests
+    // ============================================
+
+    #[tokio::test]
+    async fn test_get_page_size_sqlite_format() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create a minimal SQLite header with page size 4096
+        let mut header = vec![0u8; 100];
+        header[0..16].copy_from_slice(b"SQLite format 3\0");
+        // Page size at offset 16-17, big-endian
+        header[16..18].copy_from_slice(&4096u16.to_be_bytes());
+
+        tokio::fs::write(&db_path, header).await.unwrap();
+
+        let page_size = get_page_size(&db_path).await.unwrap();
+        assert_eq!(page_size, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_get_page_size_65536() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Page size of 1 means 65536
+        let mut header = vec![0u8; 100];
+        header[0..16].copy_from_slice(b"SQLite format 3\0");
+        header[16..18].copy_from_slice(&1u16.to_be_bytes());
+
+        tokio::fs::write(&db_path, header).await.unwrap();
+
+        let page_size = get_page_size(&db_path).await.unwrap();
+        assert_eq!(page_size, 65536);
+    }
+
+    #[tokio::test]
+    async fn test_get_page_size_various() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        for expected_size in [512u32, 1024, 2048, 4096, 8192, 16384, 32768] {
+            let db_path = dir.path().join(format!("test_{}.db", expected_size));
+
+            let mut header = vec![0u8; 100];
+            header[0..16].copy_from_slice(b"SQLite format 3\0");
+            header[16..18].copy_from_slice(&(expected_size as u16).to_be_bytes());
+
+            tokio::fs::write(&db_path, header).await.unwrap();
+
+            let page_size = get_page_size(&db_path).await.unwrap();
+            assert_eq!(page_size, expected_size, "Page size mismatch for {}", expected_size);
+        }
+    }
+
+    // ============================================
+    // DbState Tests
+    // ============================================
+
+    #[test]
+    fn test_db_state_creation() {
+        let state = DbState {
+            name: "mydb".to_string(),
+            db_path: PathBuf::from("/data/mydb.db"),
+            wal_path: PathBuf::from("/data/mydb.db-wal"),
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid: 0,
+            last_snapshot: None,
+        };
+
+        assert_eq!(state.name, "mydb");
+        assert_eq!(state.wal_offset, 0);
+        assert_eq!(state.current_txid, 0);
+        assert!(state.last_snapshot.is_none());
+    }
+
+    #[test]
+    fn test_db_state_with_txid() {
+        let state = DbState {
+            name: "testdb".to_string(),
+            db_path: PathBuf::from("/tmp/test.db"),
+            wal_path: PathBuf::from("/tmp/test.db-wal"),
+            wal_offset: 1024,
+            wal_generation: 5,
+            current_txid: 100,
+            last_snapshot: Some(Utc::now()),
+        };
+
+        assert_eq!(state.wal_offset, 1024);
+        assert_eq!(state.wal_generation, 5);
+        assert_eq!(state.current_txid, 100);
+        assert!(state.last_snapshot.is_some());
+    }
+
+    // ============================================
+    // Restore Logic Tests
+    // ============================================
+
+    #[test]
+    fn test_restore_point_in_time_txid_parsing() {
+        // Test parsing TXID as point-in-time
+        let pit = "100";
+        let result = pit.parse::<u64>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 100);
+
+        // Large TXID
+        let pit = "9999999999";
+        let result = pit.parse::<u64>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 9999999999);
+
+        // Invalid TXID (not a number)
+        let pit = "abc";
+        let result = pit.parse::<u64>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_restore_point_in_time_timestamp_parsing() {
+        // Valid ISO 8601 timestamp
+        let pit = "2024-06-15T12:30:45Z";
+        let result = chrono::DateTime::parse_from_rfc3339(pit);
+        assert!(result.is_ok());
+
+        // With timezone offset
+        let pit = "2024-06-15T12:30:45+00:00";
+        let result = chrono::DateTime::parse_from_rfc3339(pit);
+        assert!(result.is_ok());
+
+        // Invalid timestamp
+        let pit = "2024-13-45T99:99:99Z";
+        let result = chrono::DateTime::parse_from_rfc3339(pit);
+        assert!(result.is_err());
+
+        // Not a timestamp or TXID
+        let pit = "yesterday";
+        let txid_result = pit.parse::<u64>();
+        let ts_result = chrono::DateTime::parse_from_rfc3339(pit);
+        assert!(txid_result.is_err());
+        assert!(ts_result.is_err());
+    }
+
+    #[test]
+    fn test_restore_snapshot_selection_basic() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000050.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 50,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+            ],
+        };
+
+        // Select snapshot for TXID 50
+        let target = 50u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().max_txid, 50);
+    }
+
+    #[test]
+    fn test_restore_snapshot_selection_multiple_snapshots() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 200,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000025.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 25,
+                    size: 500,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000001-00000075.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 75,
+                    size: 1000,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000001-00000150.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 150,
+                    size: 1500,
+                    created_at: "2024-01-01T02:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+            ],
+        };
+
+        // Target TXID 100: should select snapshot with max_txid=75 (closest <= 100)
+        let target = 100u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().max_txid, 75);
+
+        // Target TXID 200: should select snapshot with max_txid=150
+        let target = 200u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().max_txid, 150);
+
+        // Target TXID 20: should select snapshot with max_txid=25... wait no, 25 > 20
+        // so it should fail to find one
+        let target = 20u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn test_restore_snapshot_selection_no_snapshots() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                // Only incrementals, no snapshots
+                LtxEntry {
+                    filename: "00000010-00000050.ltx".to_string(),
+                    min_txid: 10,
+                    max_txid: 50,
+                    size: 500,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        let target = 100u64;
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn test_restore_incrementals_selection() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000030.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 30,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000031-00000050.ltx".to_string(),
+                    min_txid: 31,
+                    max_txid: 50,
+                    size: 200,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                LtxEntry {
+                    filename: "00000051-00000070.ltx".to_string(),
+                    min_txid: 51,
+                    max_txid: 70,
+                    size: 200,
+                    created_at: "2024-01-01T02:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                LtxEntry {
+                    filename: "00000071-00000100.ltx".to_string(),
+                    min_txid: 71,
+                    max_txid: 100,
+                    size: 200,
+                    created_at: "2024-01-01T03:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        // Find incrementals after snapshot (max_txid=30) up to target (60)
+        let snapshot_max_txid = 30u64;
+        let target_txid = 60u64;
+
+        let incrementals: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| {
+                !f.is_snapshot
+                    && f.min_txid > snapshot_max_txid
+                    && f.max_txid <= target_txid
+            })
+            .collect();
+
+        // Should include 31-50, but not 51-70 (max_txid=70 > target=60)
+        assert_eq!(incrementals.len(), 1);
+        assert_eq!(incrementals[0].filename, "00000031-00000050.ltx");
+
+        // Find incrementals up to target 100
+        let target_txid = 100u64;
+        let incrementals: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| {
+                !f.is_snapshot
+                    && f.min_txid > snapshot_max_txid
+                    && f.max_txid <= target_txid
+            })
+            .collect();
+
+        assert_eq!(incrementals.len(), 3);
+    }
+
+    #[test]
+    fn test_restore_incrementals_ordering() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000020.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 20,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                // Out of order in manifest (should be sorted by min_txid for replay)
+                LtxEntry {
+                    filename: "00000051-00000070.ltx".to_string(),
+                    min_txid: 51,
+                    max_txid: 70,
+                    size: 200,
+                    created_at: "2024-01-01T03:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                LtxEntry {
+                    filename: "00000021-00000050.ltx".to_string(),
+                    min_txid: 21,
+                    max_txid: 50,
+                    size: 200,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        let snapshot_max_txid = 20u64;
+        let target_txid = 100u64;
+
+        let mut incrementals: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| {
+                !f.is_snapshot
+                    && f.min_txid > snapshot_max_txid
+                    && f.max_txid <= target_txid
+            })
+            .collect();
+
+        // Sort by min_txid for proper replay order
+        incrementals.sort_by_key(|f| f.min_txid);
+
+        assert_eq!(incrementals.len(), 2);
+        assert_eq!(incrementals[0].min_txid, 21); // First
+        assert_eq!(incrementals[1].min_txid, 51); // Second
+    }
+
+    #[test]
+    fn test_restore_timestamp_based_txid_selection() {
+        let manifest = Manifest {
+            name: "test".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000030.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 30,
+                    size: 1000,
+                    created_at: "2024-01-15T10:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000001-00000060.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 60,
+                    size: 1500,
+                    created_at: "2024-01-15T12:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000001-00000100.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 100,
+                    size: 2000,
+                    created_at: "2024-01-15T14:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+            ],
+        };
+
+        // Find latest file before 11:00 (should be the 10:00 one)
+        let target_dt = chrono::DateTime::parse_from_rfc3339("2024-01-15T11:00:00Z").unwrap();
+
+        let target_txid = manifest
+            .files
+            .iter()
+            .filter(|f| {
+                chrono::DateTime::parse_from_rfc3339(&f.created_at)
+                    .map(|fdt| fdt <= target_dt)
+                    .unwrap_or(false)
+            })
+            .map(|f| f.max_txid)
+            .max();
+
+        assert_eq!(target_txid, Some(30));
+
+        // Find latest file before 13:00 (should be the 12:00 one)
+        let target_dt = chrono::DateTime::parse_from_rfc3339("2024-01-15T13:00:00Z").unwrap();
+
+        let target_txid = manifest
+            .files
+            .iter()
+            .filter(|f| {
+                chrono::DateTime::parse_from_rfc3339(&f.created_at)
+                    .map(|fdt| fdt <= target_dt)
+                    .unwrap_or(false)
+            })
+            .map(|f| f.max_txid)
+            .max();
+
+        assert_eq!(target_txid, Some(60));
+    }
+
+    // ============================================
+    // LTX Decode Tests
+    // ============================================
+
+    #[tokio::test]
+    async fn test_restore_ltx_roundtrip_basic() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("original.db");
+        let ltx_path = dir.path().join("backup.ltx");
+        let restored_path = dir.path().join("restored.db");
+
+        // Create a database with recognizable content
+        let page_size = 4096u32;
+        let original_data = vec![0x42u8; page_size as usize * 3]; // 3 pages
+        tokio::fs::write(&db_path, &original_data).await.unwrap();
+
+        // Encode to LTX
+        let ltx_file = std::fs::File::create(&ltx_path).unwrap();
+        ltx::encode_snapshot(ltx_file, &db_path, page_size, 1).unwrap();
+
+        // Decode from LTX
+        let ltx_file = std::fs::File::open(&ltx_path).unwrap();
+        let header = ltx::decode_to_db(ltx_file, &restored_path).unwrap();
+
+        // Verify
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        assert_eq!(original_data, restored_data);
+        assert_eq!(header.page_size.into_inner(), page_size);
+        assert_eq!(header.commit.into_inner(), 3); // 3 pages
+    }
+
+    #[tokio::test]
+    async fn test_restore_ltx_with_varied_content() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("varied.db");
+        let restored_path = dir.path().join("restored.db");
+
+        let page_size = 4096u32;
+
+        // Create database with various byte patterns
+        let mut original_data = Vec::new();
+        for page_num in 0..5 {
+            let mut page = vec![0u8; page_size as usize];
+            // Fill with different patterns
+            for i in 0..page_size as usize {
+                page[i] = ((page_num * 256 + i) % 256) as u8;
+            }
+            original_data.extend(page);
+        }
+        tokio::fs::write(&db_path, &original_data).await.unwrap();
+
+        // Encode and decode
+        let mut ltx_buffer = Vec::new();
+        ltx::encode_snapshot(&mut ltx_buffer, &db_path, page_size, 100).unwrap();
+
+        let cursor = std::io::Cursor::new(ltx_buffer);
+        let header = ltx::decode_to_db(cursor, &restored_path).unwrap();
+
+        // Verify byte-for-byte
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        assert_eq!(original_data.len(), restored_data.len());
+
+        for (i, (orig, rest)) in original_data.iter().zip(restored_data.iter()).enumerate() {
+            assert_eq!(
+                orig, rest,
+                "Byte mismatch at offset {}: expected 0x{:02x}, got 0x{:02x}",
+                i, orig, rest
+            );
+        }
+
+        assert_eq!(header.max_txid.into_inner(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_restore_ltx_preserves_sqlite_header() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("sqlite.db");
+        let restored_path = dir.path().join("restored.db");
+
+        let page_size = 4096u32;
+
+        // Create a minimal SQLite-like database
+        let mut db_data = vec![0u8; page_size as usize];
+        // SQLite magic
+        db_data[0..16].copy_from_slice(b"SQLite format 3\0");
+        // Page size at offset 16-17 (big-endian)
+        db_data[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        // Other header fields...
+        db_data[18] = 1; // file format write version
+        db_data[19] = 1; // file format read version
+
+        tokio::fs::write(&db_path, &db_data).await.unwrap();
+
+        // Encode and decode
+        let mut ltx_buffer = Vec::new();
+        ltx::encode_snapshot(&mut ltx_buffer, &db_path, page_size, 1).unwrap();
+
+        let cursor = std::io::Cursor::new(ltx_buffer);
+        ltx::decode_to_db(cursor, &restored_path).unwrap();
+
+        // Verify SQLite header is preserved
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        assert_eq!(&restored_data[0..16], b"SQLite format 3\0");
+        assert_eq!(
+            u16::from_be_bytes([restored_data[16], restored_data[17]]),
+            page_size as u16
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_ltx_from_memory_buffer() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let restored_path = dir.path().join("restored.db");
+
+        let page_size = 4096u32;
+        let original_data = vec![0xAB; page_size as usize * 2];
+        tokio::fs::write(&db_path, &original_data).await.unwrap();
+
+        // Simulate S3 workflow: encode to Vec, decode from Cursor
+        let mut ltx_buffer: Vec<u8> = Vec::new();
+        ltx::encode_snapshot(&mut ltx_buffer, &db_path, page_size, 50).unwrap();
+
+        // This is exactly how restore() works with S3 data
+        let cursor = std::io::Cursor::new(ltx_buffer);
+        let header = ltx::decode_to_db(cursor, &restored_path).unwrap();
+
+        let restored_data = tokio::fs::read(&restored_path).await.unwrap();
+        assert_eq!(original_data, restored_data);
+        assert_eq!(header.min_txid.into_inner(), 1);
+        assert_eq!(header.max_txid.into_inner(), 50);
+    }
+
+    #[test]
+    fn test_restore_ltx_corrupted_data() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let restored_path = dir.path().join("restored.db");
+
+        // Try to decode garbage data
+        let garbage = vec![0xFF; 1000];
+        let cursor = std::io::Cursor::new(garbage);
+        let result = ltx::decode_to_db(cursor, &restored_path);
+
+        assert!(result.is_err(), "Decoding garbage should fail");
+    }
+
+    #[test]
+    fn test_restore_ltx_truncated_data() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let restored_path = dir.path().join("restored.db");
+
+        // Create valid LTX first
+        let page_size = 4096u32;
+        let db_data = vec![0x42; page_size as usize];
+        std::fs::write(&db_path, &db_data).unwrap();
+
+        let mut ltx_buffer = Vec::new();
+        ltx::encode_snapshot(&mut ltx_buffer, &db_path, page_size, 1).unwrap();
+
+        // Truncate the LTX data
+        let truncated = &ltx_buffer[0..ltx_buffer.len() / 2];
+        let cursor = std::io::Cursor::new(truncated);
+        let result = ltx::decode_to_db(cursor, &restored_path);
+
+        assert!(result.is_err(), "Decoding truncated LTX should fail");
+    }
+
+    #[test]
+    fn test_restore_ltx_empty_data() {
+        use tempfile::tempdir;
+        use crate::ltx;
+
+        let dir = tempdir().unwrap();
+        let restored_path = dir.path().join("restored.db");
+
+        let empty: Vec<u8> = Vec::new();
+        let cursor = std::io::Cursor::new(empty);
+        let result = ltx::decode_to_db(cursor, &restored_path);
+
+        assert!(result.is_err(), "Decoding empty data should fail");
+    }
+
+    // ============================================
+    // Manifest File Selection Tests
+    // ============================================
+
+    #[test]
+    fn test_manifest_empty_files() {
+        let manifest = Manifest {
+            name: "empty".to_string(),
+            current_txid: 0,
+            page_size: 4096,
+            files: vec![],
+        };
+
+        assert!(manifest.files.is_empty());
+
+        // Should trigger legacy fallback in restore()
+        let snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn test_manifest_mixed_snapshots_and_incrementals() {
+        let manifest = Manifest {
+            name: "mixed".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000010.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 10,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000011-00000020.ltx".to_string(),
+                    min_txid: 11,
+                    max_txid: 20,
+                    size: 100,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                LtxEntry {
+                    filename: "00000001-00000050.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 50,
+                    size: 2000,
+                    created_at: "2024-01-01T02:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000051-00000100.ltx".to_string(),
+                    min_txid: 51,
+                    max_txid: 100,
+                    size: 200,
+                    created_at: "2024-01-01T03:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+            ],
+        };
+
+        // Count snapshots vs incrementals
+        let snapshots: Vec<_> = manifest.files.iter().filter(|f| f.is_snapshot).collect();
+        let incrementals: Vec<_> = manifest.files.iter().filter(|f| !f.is_snapshot).collect();
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(incrementals.len(), 2);
+
+        // For target TXID 100:
+        // 1. Best snapshot is max_txid=50
+        // 2. Incrementals to apply: 51-100
+        let target = 100u64;
+        let best_snapshot = snapshots
+            .iter()
+            .filter(|f| f.max_txid <= target)
+            .max_by_key(|f| f.max_txid);
+
+        assert!(best_snapshot.is_some());
+        assert_eq!(best_snapshot.unwrap().max_txid, 50);
+
+        let snapshot_max = 50u64;
+        let needed_incrementals: Vec<_> = incrementals
+            .iter()
+            .filter(|f| f.min_txid > snapshot_max && f.max_txid <= target)
+            .collect();
+
+        assert_eq!(needed_incrementals.len(), 1);
+        assert_eq!(needed_incrementals[0].filename, "00000051-00000100.ltx");
+    }
+
+    #[test]
+    fn test_manifest_snapshot_supersedes_incrementals() {
+        // When a new snapshot is taken, it supersedes older incrementals
+        let manifest = Manifest {
+            name: "supersede".to_string(),
+            current_txid: 100,
+            page_size: 4096,
+            files: vec![
+                LtxEntry {
+                    filename: "00000001-00000030.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 30,
+                    size: 1000,
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+                LtxEntry {
+                    filename: "00000031-00000050.ltx".to_string(),
+                    min_txid: 31,
+                    max_txid: 50,
+                    size: 100,
+                    created_at: "2024-01-01T01:00:00Z".to_string(),
+                    is_snapshot: false,
+                },
+                // New snapshot that includes everything up to TXID 70
+                LtxEntry {
+                    filename: "00000001-00000070.ltx".to_string(),
+                    min_txid: 1,
+                    max_txid: 70,
+                    size: 2000,
+                    created_at: "2024-01-01T02:00:00Z".to_string(),
+                    is_snapshot: true,
+                },
+            ],
+        };
+
+        // For target TXID 70, the newer snapshot at TXID 70 should be used
+        // The incremental 31-50 is NOT needed (it's covered by the new snapshot)
+        let target = 70u64;
+
+        let best_snapshot = manifest
+            .files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target)
+            .max_by_key(|f| f.max_txid)
+            .unwrap();
+
+        assert_eq!(best_snapshot.max_txid, 70);
+
+        // No incrementals needed because snapshot covers everything
+        let incrementals: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| {
+                !f.is_snapshot
+                    && f.min_txid > best_snapshot.max_txid
+                    && f.max_txid <= target
+            })
+            .collect();
+
+        assert!(incrementals.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_integration_compaction() {
+        use crate::retention::RetentionPolicy;
+
+        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let endpoint = get_test_endpoint();
+        let test_name = format!("compact-test-{}", uuid::Uuid::new_v4());
+        let db_path = create_test_db(&test_name).await;
+
+        // Take multiple snapshots to have something to compact
+        for _ in 0..3 {
+            snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Run compaction in dry-run mode first
+        let policy = RetentionPolicy::new(1, 0, 0, 0); // Keep only 1 hourly
+        let result = compact(&test_name, &bucket, endpoint.as_deref(), &policy, false).await;
+        assert!(result.is_ok());
+
+        // Run compaction with force
+        let result = compact(&test_name, &bucket, endpoint.as_deref(), &policy, true).await;
+        assert!(result.is_ok());
+
+        // Cleanup
+        tokio::fs::remove_file(&db_path).await.ok();
+
+        // Clean up S3 (best effort)
+        let (bucket_name, prefix) = parse_bucket(&bucket);
+        if let Ok(client) = create_client(endpoint.as_deref()).await {
+            let db_prefix = format!("{}{}/", prefix, test_name);
+            if let Ok(keys) = s3::list_objects(&client, &bucket_name, &db_prefix).await {
+                let _ = s3::delete_objects(&client, &bucket_name, &keys).await;
+            }
+        }
     }
 }

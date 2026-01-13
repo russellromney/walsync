@@ -1,4 +1,5 @@
 mod ltx;
+mod retention;
 mod sync;
 mod s3;
 mod wal;
@@ -35,6 +36,30 @@ enum Commands {
         /// S3 endpoint URL (for Tigris/MinIO/etc)
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
+
+        /// Run compaction after each snapshot
+        #[arg(long)]
+        compact_after_snapshot: bool,
+
+        /// Compaction interval in seconds (0 = disabled)
+        #[arg(long, default_value = "0")]
+        compact_interval: u64,
+
+        /// Number of hourly snapshots to retain (default: 24)
+        #[arg(long, default_value = "24")]
+        retain_hourly: usize,
+
+        /// Number of daily snapshots to retain (default: 7)
+        #[arg(long, default_value = "7")]
+        retain_daily: usize,
+
+        /// Number of weekly snapshots to retain (default: 12)
+        #[arg(long, default_value = "12")]
+        retain_weekly: usize,
+
+        /// Number of monthly snapshots to retain (default: 12)
+        #[arg(long, default_value = "12")]
+        retain_monthly: usize,
     },
 
     /// Restore a database from S3
@@ -83,6 +108,40 @@ enum Commands {
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
     },
+
+    /// Compact old snapshots using retention policy (GFS rotation)
+    Compact {
+        /// Database name (as registered in S3)
+        name: String,
+
+        /// S3 bucket
+        #[arg(short, long)]
+        bucket: String,
+
+        /// S3 endpoint URL
+        #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
+        endpoint: Option<String>,
+
+        /// Number of hourly snapshots to keep (default: 24)
+        #[arg(long, default_value = "24")]
+        hourly: usize,
+
+        /// Number of daily snapshots to keep (default: 7)
+        #[arg(long, default_value = "7")]
+        daily: usize,
+
+        /// Number of weekly snapshots to keep (default: 12)
+        #[arg(long, default_value = "12")]
+        weekly: usize,
+
+        /// Number of monthly snapshots to keep (default: 12)
+        #[arg(long, default_value = "12")]
+        monthly: usize,
+
+        /// Actually delete files (default: dry-run only)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -102,8 +161,33 @@ async fn main() -> Result<()> {
             bucket,
             snapshot_interval,
             endpoint,
+            compact_after_snapshot,
+            compact_interval,
+            retain_hourly,
+            retain_daily,
+            retain_weekly,
+            retain_monthly,
         } => {
-            sync::watch(databases, &bucket, snapshot_interval, endpoint.as_deref()).await?;
+            let compact_policy = if compact_after_snapshot || compact_interval > 0 {
+                Some(retention::RetentionPolicy::new(
+                    retain_hourly,
+                    retain_daily,
+                    retain_weekly,
+                    retain_monthly,
+                ))
+            } else {
+                None
+            };
+            sync::watch(
+                databases,
+                &bucket,
+                snapshot_interval,
+                endpoint.as_deref(),
+                compact_after_snapshot,
+                compact_interval,
+                compact_policy,
+            )
+            .await?;
         }
         Commands::Restore {
             name,
@@ -123,6 +207,19 @@ async fn main() -> Result<()> {
             endpoint,
         } => {
             sync::snapshot(&database, &bucket, endpoint.as_deref()).await?;
+        }
+        Commands::Compact {
+            name,
+            bucket,
+            endpoint,
+            hourly,
+            daily,
+            weekly,
+            monthly,
+            force,
+        } => {
+            let policy = retention::RetentionPolicy::new(hourly, daily, weekly, monthly);
+            sync::compact(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
         }
     }
 
