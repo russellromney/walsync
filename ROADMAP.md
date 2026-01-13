@@ -71,10 +71,11 @@ walsync watch mydb.db -b s3://my-bucket \
   - [x] Restore by timestamp (e.g., `--point-in-time 2024-01-15T10:30:00Z`)
   - [x] Binary data preservation verified with extensive tests
 - [x] manifest.json tracking with LtxEntry metadata (done - v0.3)
-- [ ] Store incremental WAL changes as LTX (not raw WAL segments)
-  - Note: Currently WAL is synced as raw segments for simplicity
-  - LTX incremental requires sequential pages + pre_apply_checksum chaining
-  - Snapshots provide main restore capability; WAL replay is future work
+- [x] Store incremental WAL changes as LTX (done - v0.3)
+  - [x] Checksum chaining (pre_apply_checksum → post_apply_checksum)
+  - [x] WAL page deduplication (keep only latest version of each page)
+  - [x] In-place LTX apply for efficient incremental restore
+  - [x] Track db_checksum in state, recompute from db on restart
 
 ### Sync Triggers
 ```toml
@@ -182,10 +183,11 @@ snapshot_interval = "30m"  # Per-DB override
    - [x] Metrics: last_sync, wal_size, next_snapshot, error_count, snapshot_count, current_txid, uptime
 
 ### Priority 3 - Advanced Features
-5. **Incremental WAL as LTX** (future optimization)
-   - Currently: snapshots are LTX, WAL is raw segments
-   - Challenge: LTX incremental needs sequential pages + checksum chaining
-   - Consider if raw WAL is sufficient for most use cases
+5. **Incremental WAL as LTX** ✅ COMPLETE
+   - [x] WAL changes encoded as incremental LTX (not raw segments)
+   - [x] Checksum chaining for LTX integrity verification
+   - [x] In-place apply_ltx_to_db for efficient restore
+   - [x] Comprehensive tests (98 total, all passing)
 
 ---
 
@@ -267,13 +269,13 @@ s3://bucket/prefix/
   - [x] manifest.json tracking with TXID sequencing
   - [x] Point-in-time restore by TXID or timestamp
   - [x] Binary data preservation with extensive test coverage
-  - [x] 87 total tests (70 unit + 17 integration with real S3)
+  - [x] 98 total tests (all passing)
 - [x] **Snapshot Compaction & Retention**
   - [x] GFS rotation (hourly/daily/weekly/monthly tiers)
   - [x] `walsync compact` command with dry-run default
   - [x] Auto-compaction in watch mode (--compact-after-snapshot, --compact-interval)
   - [x] Batch S3 delete operations
-- [x] WAL sync to S3/Tigris (raw segments, not LTX yet)
+- [x] WAL sync to S3/Tigris as incremental LTX files
 - [x] SHA256 checksums in S3 metadata
 - [x] Multi-database support (single process)
 - [x] Snapshot scheduling (time-based intervals)
