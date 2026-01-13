@@ -159,6 +159,30 @@ List backed up databases.
 walsync list -b <BUCKET>
 ```
 
+### `walsync explain`
+
+Show what the current configuration will do without running.
+
+```bash
+walsync explain [--config <CONFIG>]
+```
+
+Displays: S3 settings, snapshot triggers, compaction settings, retention policy, and resolved database paths.
+
+### `walsync verify`
+
+Verify integrity of LTX files in S3.
+
+```bash
+walsync verify <NAME> -b <BUCKET> [OPTIONS]
+
+Options:
+  --endpoint <URL>  S3 endpoint
+  --fix             Remove orphaned manifest entries
+```
+
+Checks: file existence, header validity, checksums, TXID continuity.
+
 ## Environment Variables
 
 - `AWS_ACCESS_KEY_ID` - AWS/Tigris access key

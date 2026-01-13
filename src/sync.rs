@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::config::{ResolvedDbConfig, SyncConfig};
+use crate::config::{Config, ResolvedDbConfig, SyncConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
@@ -1812,6 +1812,356 @@ fn save_replica_state(local: &Path, current_txid: u64) -> Result<()> {
     };
     let data = serde_json::to_string_pretty(&state)?;
     std::fs::write(&state_path, data)?;
+    Ok(())
+}
+
+/// Explain what the current configuration will do without running
+///
+/// Loads the config file and prints a human-readable summary of:
+/// - Databases being watched (resolved from config/globs)
+/// - Snapshot triggers (interval, max_changes, on_idle, on_startup)
+/// - Compaction settings if enabled
+/// - Retention policy tiers
+/// - S3 bucket and endpoint
+pub fn explain(config: &Option<Config>) -> Result<()> {
+    match config {
+        None => {
+            println!("No configuration file found.");
+            println!();
+            println!("walsync looks for ./walsync.toml in the current directory,");
+            println!("or you can specify a config file with --config <path>.");
+            println!();
+            println!("Without a config file, you must provide all options via CLI:");
+            println!("  walsync watch <database> --bucket <bucket> [options]");
+            return Ok(());
+        }
+        Some(cfg) => {
+            println!("Configuration Summary");
+            println!("=====================");
+            println!();
+
+            // S3 Settings
+            println!("S3 Storage:");
+            if let Some(bucket) = &cfg.s3.bucket {
+                println!("  Bucket:   {}", bucket);
+            } else {
+                println!("  Bucket:   (not configured - must specify via --bucket)");
+            }
+            if let Some(endpoint) = &cfg.s3.endpoint {
+                println!("  Endpoint: {}", endpoint);
+            } else {
+                println!("  Endpoint: (default AWS S3)");
+            }
+            println!();
+
+            // Snapshot Triggers
+            println!("Snapshot Triggers (global defaults):");
+            println!("  Interval:    {} seconds ({} minutes)",
+                cfg.sync.snapshot_interval,
+                cfg.sync.snapshot_interval / 60
+            );
+            if cfg.sync.max_changes > 0 {
+                println!("  Max changes: {} WAL frames", cfg.sync.max_changes);
+            } else {
+                println!("  Max changes: disabled");
+            }
+            if cfg.sync.max_interval > 0 {
+                println!("  Max interval: {} seconds", cfg.sync.max_interval);
+            }
+            if cfg.sync.on_idle > 0 {
+                println!("  On idle:     {} seconds", cfg.sync.on_idle);
+            } else {
+                println!("  On idle:     disabled");
+            }
+            println!("  On startup:  {}", if cfg.sync.on_startup { "yes" } else { "no" });
+            println!();
+
+            // Compaction Settings
+            println!("Compaction:");
+            if cfg.sync.compact_after_snapshot {
+                println!("  After snapshot: enabled");
+            } else {
+                println!("  After snapshot: disabled");
+            }
+            if cfg.sync.compact_interval > 0 {
+                println!("  Interval:       {} seconds ({} minutes)",
+                    cfg.sync.compact_interval,
+                    cfg.sync.compact_interval / 60
+                );
+            } else {
+                println!("  Interval:       disabled");
+            }
+            println!();
+
+            // Retention Policy
+            println!("Retention Policy (GFS rotation):");
+            println!("  Hourly:  {} snapshots (last {} hours)", cfg.retention.hourly, cfg.retention.hourly);
+            println!("  Daily:   {} snapshots (last {} days)", cfg.retention.daily, cfg.retention.daily);
+            println!("  Weekly:  {} snapshots (last {} weeks)", cfg.retention.weekly, cfg.retention.weekly);
+            println!("  Monthly: {} snapshots (last {} months)", cfg.retention.monthly, cfg.retention.monthly);
+            println!();
+
+            // Databases
+            println!("Databases:");
+            if cfg.databases.is_empty() {
+                println!("  (none configured - must specify via CLI)");
+            } else {
+                // Resolve databases to show actual paths
+                match cfg.resolve_databases() {
+                    Ok(resolved) => {
+                        if resolved.is_empty() {
+                            println!("  (no matching files found for configured patterns)");
+                        } else {
+                            for db in &resolved {
+                                println!("  - {} -> s3://.../{}/*", db.path.display(), db.prefix);
+
+                                // Show per-database overrides if different from global
+                                let mut overrides = Vec::new();
+                                if db.sync.snapshot_interval != cfg.sync.snapshot_interval {
+                                    overrides.push(format!("interval={}s", db.sync.snapshot_interval));
+                                }
+                                if db.sync.max_changes != cfg.sync.max_changes {
+                                    overrides.push(format!("max_changes={}", db.sync.max_changes));
+                                }
+                                if db.retention.hourly != cfg.retention.hourly
+                                    || db.retention.daily != cfg.retention.daily
+                                    || db.retention.weekly != cfg.retention.weekly
+                                    || db.retention.monthly != cfg.retention.monthly
+                                {
+                                    overrides.push(format!(
+                                        "retention={}/{}/{}/{}",
+                                        db.retention.hourly, db.retention.daily,
+                                        db.retention.weekly, db.retention.monthly
+                                    ));
+                                }
+                                if !overrides.is_empty() {
+                                    println!("    Overrides: {}", overrides.join(", "));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  (error resolving databases: {})", e);
+                        for db in &cfg.databases {
+                            println!("  - {} (pattern)", db.path);
+                        }
+                    }
+                }
+            }
+            println!();
+
+            // Summary
+            let total_snapshots = cfg.retention.hourly + cfg.retention.daily
+                + cfg.retention.weekly + cfg.retention.monthly;
+            println!("Summary:");
+            println!("  Max snapshots retained per database: ~{}", total_snapshots);
+            if cfg.sync.compact_after_snapshot || cfg.sync.compact_interval > 0 {
+                println!("  Automatic compaction: enabled");
+            } else {
+                println!("  Automatic compaction: disabled (run 'walsync compact' manually)");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Verification issue found during verify
+#[derive(Debug)]
+pub struct VerifyIssue {
+    pub filename: String,
+    pub issue: String,
+    pub is_orphan: bool,
+}
+
+/// Verify integrity of all LTX files in S3 for a database
+///
+/// Checks:
+/// - Each LTX file in manifest exists in S3
+/// - LTX headers can be decoded
+/// - LTX internal checksums are valid
+/// - TXID continuity (no gaps in the chain)
+///
+/// With --fix, removes orphaned entries from manifest
+pub async fn verify(
+    name: &str,
+    bucket: &str,
+    endpoint: Option<&str>,
+    fix: bool,
+) -> Result<()> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint).await?;
+
+    println!("Verifying integrity of '{}' in s3://{}/{}{}...",
+        name, bucket_name, prefix, name);
+    println!();
+
+    // Load manifest
+    let manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
+
+    if manifest.files.is_empty() {
+        println!("No LTX files found in manifest.");
+        return Ok(());
+    }
+
+    println!("Found {} LTX files in manifest", manifest.files.len());
+    println!("Current TXID: {}", manifest.current_txid);
+    println!("Page size: {} bytes", manifest.page_size);
+    println!();
+
+    let mut issues: Vec<VerifyIssue> = Vec::new();
+    let mut verified_count = 0;
+    let mut total_size: u64 = 0;
+
+    // Check each LTX file
+    for entry in &manifest.files {
+        let ltx_key = format!("{}{}/{}", prefix, name, entry.filename);
+
+        // Check if file exists in S3
+        match s3::exists(&client, &bucket_name, &ltx_key).await {
+            Ok(true) => {
+                // File exists, download and verify
+                match s3::download_bytes(&client, &bucket_name, &ltx_key).await {
+                    Ok(data) => {
+                        let cursor = std::io::Cursor::new(&data);
+                        match ltx::verify_ltx(cursor) {
+                            Ok(header) => {
+                                // Verify header matches manifest entry
+                                let header_min = header.min_txid.into_inner();
+                                let header_max = header.max_txid.into_inner();
+
+                                if header_min != entry.min_txid || header_max != entry.max_txid {
+                                    issues.push(VerifyIssue {
+                                        filename: entry.filename.clone(),
+                                        issue: format!(
+                                            "TXID mismatch: manifest says {}-{}, header says {}-{}",
+                                            entry.min_txid, entry.max_txid,
+                                            header_min, header_max
+                                        ),
+                                        is_orphan: false,
+                                    });
+                                } else {
+                                    verified_count += 1;
+                                    total_size += data.len() as u64;
+                                }
+                            }
+                            Err(e) => {
+                                issues.push(VerifyIssue {
+                                    filename: entry.filename.clone(),
+                                    issue: format!("Checksum verification failed: {}", e),
+                                    is_orphan: false,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        issues.push(VerifyIssue {
+                            filename: entry.filename.clone(),
+                            issue: format!("Download failed: {}", e),
+                            is_orphan: false,
+                        });
+                    }
+                }
+            }
+            Ok(false) => {
+                // File missing from S3 but in manifest
+                issues.push(VerifyIssue {
+                    filename: entry.filename.clone(),
+                    issue: "File missing from S3".to_string(),
+                    is_orphan: true,
+                });
+            }
+            Err(e) => {
+                issues.push(VerifyIssue {
+                    filename: entry.filename.clone(),
+                    issue: format!("S3 check failed: {}", e),
+                    is_orphan: false,
+                });
+            }
+        }
+    }
+
+    // Check TXID continuity
+    let mut sorted_files: Vec<_> = manifest.files.iter().collect();
+    sorted_files.sort_by_key(|f| f.min_txid);
+
+    let mut expected_next_txid: Option<u64> = None;
+    for entry in &sorted_files {
+        if let Some(expected) = expected_next_txid {
+            // For incrementals, min_txid should be expected (previous max + 1)
+            // For snapshots, they can reset the chain (min_txid = 1)
+            if !entry.is_snapshot && entry.min_txid != expected {
+                // Check if there's a gap
+                if entry.min_txid > expected {
+                    issues.push(VerifyIssue {
+                        filename: entry.filename.clone(),
+                        issue: format!(
+                            "TXID gap: expected min_txid={}, got {} (missing TXIDs {}-{})",
+                            expected, entry.min_txid,
+                            expected, entry.min_txid - 1
+                        ),
+                        is_orphan: false,
+                    });
+                }
+            }
+        }
+        expected_next_txid = Some(entry.max_txid + 1);
+    }
+
+    // Report results
+    println!("Verification Results");
+    println!("====================");
+    println!("Verified:  {} files ({:.2} MB)", verified_count, total_size as f64 / (1024.0 * 1024.0));
+    println!("Issues:    {}", issues.len());
+    println!();
+
+    if issues.is_empty() {
+        println!("All LTX files verified successfully.");
+        return Ok(());
+    }
+
+    // Report issues
+    println!("Issues Found:");
+    let orphan_count = issues.iter().filter(|i| i.is_orphan).count();
+    let other_count = issues.len() - orphan_count;
+
+    for issue in &issues {
+        let marker = if issue.is_orphan { "[ORPHAN]" } else { "[ERROR]" };
+        println!("  {} {}: {}", marker, issue.filename, issue.issue);
+    }
+    println!();
+
+    // Fix orphaned entries if requested
+    if fix && orphan_count > 0 {
+        println!("Fixing {} orphaned manifest entries...", orphan_count);
+
+        let orphan_filenames: std::collections::HashSet<_> = issues
+            .iter()
+            .filter(|i| i.is_orphan)
+            .map(|i| &i.filename)
+            .collect();
+
+        let mut fixed_manifest = manifest.clone();
+        fixed_manifest.files.retain(|f| !orphan_filenames.contains(&f.filename));
+
+        // Update current_txid to latest remaining file
+        if let Some(latest) = fixed_manifest.files.iter().max_by_key(|f| f.max_txid) {
+            fixed_manifest.current_txid = latest.max_txid;
+        }
+
+        save_manifest(&client, &bucket_name, &prefix, &fixed_manifest).await?;
+        println!("Removed {} orphaned entries from manifest.", orphan_count);
+    } else if orphan_count > 0 {
+        println!("Run with --fix to remove {} orphaned manifest entries.", orphan_count);
+    }
+
+    if other_count > 0 {
+        println!();
+        println!("Note: {} non-orphan issues found. These may require manual intervention:", other_count);
+        println!("  - Checksum failures indicate corrupted files");
+        println!("  - TXID gaps may require restoring from an earlier snapshot");
+    }
+
     Ok(())
 }
 

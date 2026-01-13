@@ -164,6 +164,25 @@ pub fn encode_wal_changes<W: Write>(
     Ok(trailer.post_apply_checksum)
 }
 
+/// Verify an LTX file by decoding all pages and checking the checksum
+/// Returns the header on success, or an error describing the verification failure
+pub fn verify_ltx<R: Read>(reader: R) -> Result<Header> {
+    let (mut decoder, header) = Decoder::new(reader)?;
+
+    let page_size = header.page_size.into_inner() as usize;
+    let mut page_buf = vec![0u8; page_size];
+
+    // Decode all pages (required to verify checksum)
+    while decoder.decode_page(&mut page_buf)?.is_some() {
+        // Just consume the pages
+    }
+
+    // Verify checksum - this will fail if corrupted
+    decoder.finish()?;
+
+    Ok(header)
+}
+
 /// Compute database checksum (single u64 from SHA256)
 fn compute_db_checksum(data: &[u8]) -> Checksum {
     use sha2::{Digest, Sha256};

@@ -191,6 +191,27 @@ enum Commands {
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
     },
+
+    /// Explain what the current configuration will do (dry-run preview)
+    Explain,
+
+    /// Verify integrity of LTX files in S3
+    Verify {
+        /// Database name (as registered in S3)
+        name: String,
+
+        /// S3 bucket
+        #[arg(short, long)]
+        bucket: String,
+
+        /// S3 endpoint URL
+        #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
+        endpoint: Option<String>,
+
+        /// Fix issues by removing orphaned manifest entries
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 /// CLI arguments for Watch command
@@ -505,6 +526,19 @@ async fn main() -> Result<()> {
         } => {
             let duration = parse_duration(&interval)?;
             sync::replicate(&source, &local, duration, endpoint.as_deref()).await?;
+        }
+
+        Commands::Explain => {
+            sync::explain(&config)?;
+        }
+
+        Commands::Verify {
+            name,
+            bucket,
+            endpoint,
+            fix,
+        } => {
+            sync::verify(&name, &bucket, endpoint.as_deref(), fix).await?;
         }
     }
 

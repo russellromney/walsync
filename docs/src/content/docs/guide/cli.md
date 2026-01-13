@@ -15,6 +15,8 @@ Commands:
   list       List databases in S3 bucket
   compact    Clean up old snapshots using retention policy
   replicate  Run as a read replica, polling S3 for changes
+  explain    Show what the current configuration will do
+  verify     Verify integrity of LTX files in S3
   help       Print help for a command
 ```
 
@@ -442,6 +444,159 @@ Databases in s3://my-backups/:
     WAL segments: 12
     Checksum: b4c3d2e1f0a9...
 ```
+
+---
+
+## explain
+
+Show what the current configuration will do without actually running walsync.
+
+```bash
+walsync explain [--config <CONFIG>]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--config <CONFIG>` | Path to config file (default: ./walsync.toml) |
+| `-h, --help` | Print help |
+
+### Output
+
+The explain command displays:
+- **S3 Storage**: Bucket and endpoint configuration
+- **Snapshot Triggers**: Interval, max_changes, on_idle, on_startup settings
+- **Compaction**: Whether auto-compaction is enabled
+- **Retention Policy**: GFS tier settings (hourly/daily/weekly/monthly)
+- **Databases**: Resolved database paths with any per-database overrides
+
+### Examples
+
+```bash
+# Explain default config (./walsync.toml)
+walsync explain
+
+# Explain specific config file
+walsync explain --config /etc/walsync/production.toml
+```
+
+### Output Example
+
+```
+Configuration Summary
+=====================
+
+S3 Storage:
+  Bucket:   s3://my-backups/prod
+  Endpoint: https://fly.storage.tigris.dev
+
+Snapshot Triggers (global defaults):
+  Interval:    3600 seconds (60 minutes)
+  Max changes: 100 WAL frames
+  On idle:     60 seconds
+  On startup:  yes
+
+Compaction:
+  After snapshot: enabled
+  Interval:       disabled
+
+Retention Policy (GFS rotation):
+  Hourly:  24 snapshots (last 24 hours)
+  Daily:   7 snapshots (last 7 days)
+  Weekly:  12 snapshots (last 12 weeks)
+  Monthly: 12 snapshots (last 12 months)
+
+Databases:
+  - /var/lib/app.db -> s3://.../main/*
+  - /var/lib/users.db -> s3://.../users/*
+    Overrides: interval=1800s, max_changes=50
+
+Summary:
+  Max snapshots retained per database: ~55
+  Automatic compaction: enabled
+```
+
+---
+
+## verify
+
+Verify integrity of all LTX files stored in S3 for a database.
+
+```bash
+walsync verify [OPTIONS] --bucket <BUCKET> <NAME>
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<NAME>` | Database name as stored in S3 |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-b, --bucket <BUCKET>` | S3 bucket (required) |
+| `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
+| `--fix` | Remove orphaned entries from manifest |
+| `-h, --help` | Print help |
+
+### What It Checks
+
+1. **File Existence**: Each LTX file in the manifest exists in S3
+2. **Header Validity**: LTX headers can be decoded successfully
+3. **Checksum Verification**: LTX internal checksums match the data
+4. **TXID Continuity**: No gaps in the transaction ID chain
+5. **Manifest Consistency**: Header TXIDs match manifest entries
+
+### Examples
+
+```bash
+# Verify a database (read-only check)
+walsync verify myapp.db --bucket my-backups
+
+# Verify with Tigris endpoint
+walsync verify myapp.db \
+  --bucket my-backups \
+  --endpoint https://fly.storage.tigris.dev
+
+# Fix orphaned manifest entries
+walsync verify myapp.db --bucket my-backups --fix
+```
+
+### Output
+
+```
+Verifying integrity of 'myapp.db' in s3://my-backups/myapp.db...
+
+Found 47 LTX files in manifest
+Current TXID: 1523
+Page size: 4096 bytes
+
+Verification Results
+====================
+Verified:  45 files (12.34 MB)
+Issues:    2
+
+Issues Found:
+  [ORPHAN] 00000100-00000105.ltx: File missing from S3
+  [ERROR] 00000200-00000210.ltx: Checksum verification failed
+
+Run with --fix to remove 1 orphaned manifest entries.
+
+Note: 1 non-orphan issues found. These may require manual intervention:
+  - Checksum failures indicate corrupted files
+  - TXID gaps may require restoring from an earlier snapshot
+```
+
+### Issue Types
+
+| Type | Description | Fix |
+|------|-------------|-----|
+| `[ORPHAN]` | Manifest entry exists but S3 file is missing | Use `--fix` to remove from manifest |
+| `[ERROR]` | Checksum failure or corrupted file | Restore from backup, investigate cause |
+| `TXID gap` | Missing transactions in the chain | May need point-in-time restore |
 
 ---
 

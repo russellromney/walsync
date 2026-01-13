@@ -38,8 +38,9 @@ walsync snapshot <db>                    # Immediate snapshot
 walsync restore <name> -o <output>       # Restore database
 walsync list                             # List backups
 walsync compact <name> -b <bucket>       # Clean up old snapshots
-walsync replicate <source> --local <db>  # Poll-based read replica (NEW)
-walsync explain [--config file]          # Show trigger schedule
+walsync replicate <source> --local <db>  # Poll-based read replica
+walsync explain [--config file]          # Show config summary (dry-run)
+walsync verify <name> -b <bucket>        # Verify LTX integrity in S3
 ```
 
 **Compaction Usage:**
@@ -218,9 +219,8 @@ walsync serve --port 8080 --db replica.db
 
 ### Additional Commands
 ```bash
-walsync verify --bucket s3://...        # Verify all checksums
-walsync cleanup --dry-run               # Preview deletions
-walsync compact --level 2               # Manual compaction
+walsync verify <name> -b s3://...       # ✅ Verify LTX checksums + TXID continuity
+walsync explain [--config file]         # ✅ Show config summary without running
 ```
 
 ---
@@ -284,6 +284,9 @@ s3://bucket/prefix/
   - [x] Auto-bootstrap from latest snapshot
   - [x] In-place incremental LTX apply
   - [x] TXID tracking with resume capability
+- [x] **Operational Commands**
+  - [x] `walsync explain` - Show config summary without running
+  - [x] `walsync verify` - Verify LTX integrity (checksums, TXID continuity, --fix)
 - [x] WAL sync to S3/Tigris as incremental LTX files
 - [x] SHA256 checksums in S3 metadata
 - [x] Multi-database support (single process)
