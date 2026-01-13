@@ -1,32 +1,19 @@
+// @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
+  site: 'https://walsync.dev',
   integrations: [
     starlight({
       title: 'Walsync',
-      description: 'Lightweight SQLite WAL sync to S3/Tigris with explicit data integrity verification',
-      logo: {
-        src: './public/logo.svg',
-        alt: 'Walsync',
-      },
-      favicon: './public/favicon.svg',
-      social: [
-        { label: 'GitHub', href: 'https://github.com/russellromney/walsync', icon: 'github' },
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/russellromney/walsync' }],
+      sidebar: [
+        { label: 'Getting Started', autogenerate: { directory: 'start' } },
+        { label: 'Guides', autogenerate: { directory: 'guide' } },
+        { label: 'Concepts', autogenerate: { directory: 'concepts' } },
       ],
-      // Disable dark mode - clean simple design
       customCss: ['./src/styles/custom.css'],
-      head: [
-        {
-          tag: 'meta',
-          attrs: {
-            name: 'color-scheme',
-            content: 'light',
-          },
-        },
-      ],
     }),
   ],
-  site: 'https://walsync.dev',
-  output: 'static',
 });

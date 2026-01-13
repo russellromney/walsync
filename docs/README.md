@@ -1,125 +1,49 @@
-# Walsync Documentation
+# Starlight Starter Kit: Basics
 
-Professional documentation site built with [Astro Starlight](https://starlight.astro.build/).
-
-## Local Development
-
-### Prerequisites
-- Node.js 18+
-- npm or yarn
-
-### Setup
-
-```bash
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
-```
-
-Visit http://localhost:3000 to see the docs.
-
-### Build
-
-```bash
-# Build static site
-npm run build
-
-# Preview build output
-npm run preview
-```
-
-## Structure
+[![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
 
 ```
-docs/
-├── astro.config.mjs          # Astro configuration
-├── package.json              # Dependencies
+npm create astro@latest -- --template starlight
+```
+
+> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+
+## 🚀 Project Structure
+
+Inside of your Astro + Starlight project, you'll see the following folders and files:
+
+```
+.
+├── public/
 ├── src/
-│   ├── content/docs/
-│   │   ├── start/            # Getting started guides
-│   │   ├── guide/            # How-to guides
-│   │   ├── concepts/         # Deep dive topics
-│   │   └── reference/        # API reference
-│   └── styles/
-│       └── custom.css        # Clean light-mode styling
-└── public/
-    └── logo.svg              # Walsync logo
+│   ├── assets/
+│   ├── content/
+│   │   └── docs/
+│   └── content.config.ts
+├── astro.config.mjs
+├── package.json
+└── tsconfig.json
 ```
 
-## Writing Documentation
+Starlight looks for `.md` or `.mdx` files in the `src/content/docs/` directory. Each file is exposed as a route based on its file name.
 
-### Add a New Page
+Images can be added to `src/assets/` and embedded in Markdown with a relative link.
 
-1. Create `.mdx` file in appropriate folder under `src/content/docs/`
-2. Add frontmatter:
-   ```yaml
-   ---
-   title: Page Title
-   description: Short description
-   ---
-   ```
-3. Write content in Markdown
-4. Update sidebar in `astro.config.mjs` to include new page
+Static assets, like favicons, can be placed in the `public/` directory.
 
-### Markdown Features
+## 🧞 Commands
 
-All standard Markdown plus:
-- Code syntax highlighting
-- Callouts/asides:
-  ```markdown
-  :::note
-  This is a note
-  :::
+All commands are run from the root of the project, from a terminal:
 
-  :::caution
-  This is a warning
-  :::
+| Command                   | Action                                           |
+| :------------------------ | :----------------------------------------------- |
+| `npm install`             | Installs dependencies                            |
+| `npm run dev`             | Starts local dev server at `localhost:4321`      |
+| `npm run build`           | Build your production site to `./dist/`          |
+| `npm run preview`         | Preview your build locally, before deploying     |
+| `npm run astro ...`       | Run CLI commands like `astro add`, `astro check` |
+| `npm run astro -- --help` | Get help using the Astro CLI                     |
 
-  :::tip
-  This is a tip
-  :::
-  ```
+## 👀 Want to learn more?
 
-## Deployment
-
-### GitHub Pages
-
-Push to `main` branch - GitHub Actions automatically:
-1. Builds the documentation site
-2. Deploys to GitHub Pages
-3. Updates at `https://russellromney.github.io/walsync/`
-
-### Custom Domain
-
-To use `walsync.dev`:
-1. Set custom domain in GitHub repository settings
-2. Configure DNS with CNAME record pointing to `russellromney.github.io`
-3. Update `astro.config.mjs` `site` field to `https://walsync.dev`
-
-## Design
-
-- **Light mode only** - No dark mode switcher for simplicity
-- **Clean typography** - System fonts, generous spacing
-- **Teal accent** - #0f766e for links and highlights
-- **Professional** - Inspired by Litestream's documentation
-- **Mobile-friendly** - Responsive design
-
-## Styling
-
-All styling is in `src/styles/custom.css`:
-- No CSS framework dependencies
-- Override Starlight defaults
-- Custom light-mode color scheme
-
-## Inspiration
-
-This documentation site draws inspiration from:
-- [Litestream](https://litestream.io) - Professional, focused, simple
-- [Astro Docs](https://docs.astro.build) - Clean design, excellent navigation
-- [Rust Book](https://doc.rust-lang.org/book) - Clear explanations, great examples
-
----
-
-**Need help?** Check the [Astro Starlight docs](https://starlight.astro.build/).
+Check out [Starlight’s docs](https://starlight.astro.build/), read [the Astro documentation](https://docs.astro.build), or jump into the [Astro Discord server](https://astro.build/chat).

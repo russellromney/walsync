@@ -1,4 +1,4 @@
-.PHONY: build release test test-integration test-all clean install dev check fmt lint publish publish-pypi build-python help
+.PHONY: build release test test-integration test-all clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
 
 # Default target
 all: build
@@ -31,6 +31,18 @@ test-all:
 # Run tests with output
 test-verbose:
 	cargo test -- --nocapture
+
+# Run micro-benchmarks (cargo bench)
+bench:
+	cargo bench
+
+# Run comparison benchmark (walsync vs litestream)
+bench-compare: release
+	uv run bench/compare.py
+
+# Run real-world benchmarks (sync latency, restore, multi-DB)
+bench-realworld: release
+	uv run bench/realworld.py
 
 # Clean build artifacts
 clean:
@@ -101,6 +113,11 @@ help:
 	@echo "    make test-integration - Run integration tests (requires S3 credentials)"
 	@echo "    make test-all       - Run all tests"
 	@echo "    make test-verbose   - Run tests with output"
+	@echo ""
+	@echo "  Benchmark:"
+	@echo "    make bench          - Run micro-benchmarks (cargo bench)"
+	@echo "    make bench-compare  - Compare walsync vs litestream (memory/CPU)"
+	@echo "    make bench-realworld - Real-world benchmarks (sync latency, restore, multi-DB)"
 	@echo ""
 	@echo "  Code Quality:"
 	@echo "    make check        - Check for errors"

@@ -153,11 +153,13 @@ See [DATA_INTEGRITY.md](DATA_INTEGRITY.md) for complete testing details.
 
 ### Multi-Database Scalability
 
-| Scenario | Litestream | Walsync | Savings |
-|----------|-----------|---------|---------|
-| 5 databases | 5 processes × 50MB | 1 process × 10MB | **200 MB** |
-| 10 databases | 10 processes × 50MB | 1 process × 10MB | **450 MB** |
-| 100 databases | 100 processes × 50MB | 1 process × 10MB | **4950 MB** |
+| Databases | Litestream | Walsync | Savings |
+|-----------|-----------|---------|---------|
+| 5 | 158 MB (5 processes) | ~1 MB (1 process) | **157 MB** |
+| 10 | 327 MB (10 processes) | ~1 MB (1 process) | **326 MB** |
+| 20 | 685 MB (20 processes) | ~3 MB (1 process) | **682 MB** |
+
+*Measured on macOS. See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full results.*
 
 Single walsync process handles multiple databases with shared S3 connection pooling.
 
@@ -191,9 +193,11 @@ All databases sync with single process, saving 200MB+ memory vs Litestream.
 ## Documentation
 
 - [ROADMAP.md](ROADMAP.md) - Planned features and direction
+- [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Performance benchmark results
 - [CHECKSUM_STRATEGY.md](CHECKSUM_STRATEGY.md) - SHA256 implementation strategy
 - [DATA_INTEGRITY.md](DATA_INTEGRITY.md) - Data integrity guarantees and testing
 - [TESTING.md](TESTING.md) - Comprehensive testing guide
+- [bench/](bench/) - Performance benchmarks (micro, comparison, real-world)
 
 ## License
 

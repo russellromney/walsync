@@ -30,12 +30,18 @@ Low-latency real-time replication mode for read replicas.
 - Discovery: static config vs mDNS vs control plane?
 - Consistency: async replication or synchronous commit?
 
-### Compression
-- Optional gzip/zstd for WAL segments
-- Reduce S3 storage and transfer costs
+### Documentation
+- **Litestream acknowledgment** - Credit Litestream, explain when to use it vs walsync
+- **Performance benchmarks** - Memory, CPU, latency comparisons across scenarios (in progress: see `bench/`)
 
 ## Not Planned
 
-- Encryption (use S3 server-side encryption)
-- Custom binary format (keep it simple, debuggable)
-- GUI/web interface
+Walsync is intentionally simple. These features are out of scope:
+
+- **Compression** - Use SQLite extensions (sqlite-zstd); WAL inherits it automatically
+- **Encryption** - Use SQLCipher or SQLite SEE; WAL inherits it automatically
+- **Compaction** - WAL segments stay as-is; use S3 lifecycle rules for cleanup
+- **LTX format** - No custom binary format like Litestream; raw WAL is debuggable
+- **Retention policies** - Use S3 lifecycle rules
+- **GUI/web interface** - CLI-first tool for developers
+- **Restore UI** - Just `walsync restore`, no wizards

@@ -1,0 +1,29 @@
+---
+title: Walsync
+description: Lightweight SQLite WAL sync to S3 with data integrity verification
+---
+
+# Walsync
+
+Lightweight SQLite WAL sync to S3 with cryptographic integrity verification.
+
+- **Data Integrity**: SHA256 checksums on every snapshot
+- **Multi-Database**: One process syncs unlimited databases
+- **Lightweight**: ~7MB binary, ~10MB RAM
+- **S3 Compatible**: AWS S3, Tigris, MinIO, R2
+
+## Quick Install
+
+```bash
+cargo install walsync
+# or
+pip install walsync
+```
+
+## Quick Start
+
+```bash
+walsync snapshot mydb.db --bucket my-bucket
+walsync watch mydb.db --bucket my-bucket
+walsync restore mydb.db --bucket my-bucket -o restored.db
+```

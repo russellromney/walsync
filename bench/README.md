@@ -1,0 +1,174 @@
+# Walsync Benchmarks
+
+Performance benchmarks for walsync covering micro-benchmarks, comparison with litestream, and real-world scenarios.
+
+## Quick Start
+
+```bash
+# Micro-benchmarks (WAL parsing, SHA256)
+make bench
+
+# Compare walsync vs litestream (memory/CPU)
+make bench-compare
+
+# Real-world benchmarks (sync latency, restore performance)
+make bench-realworld
+```
+
+## Benchmark Types
+
+### 1. Micro-benchmarks (`cargo bench`)
+
+CPU-bound operations measured with [brunch](https://docs.rs/brunch):
+
+- **WAL header parsing**: ~47ns per header
+- **WAL frame parsing**: ~32ns per frame
+- **SHA256 checksums**: 6μs (1KB) → 5ms (1MB)
+
+Run with: `make bench` or `cargo bench`
+
+### 2. Comparison Benchmarks (`compare.py`)
+
+Memory and CPU usage comparison between walsync and litestream:
+
+| Scenario | Metric | Litestream | Walsync | Savings |
+|----------|--------|------------|---------|---------|
+| 5 DBs | Memory | 250MB (5×50MB) | ~10MB | **240MB** |
+| 10 DBs | Memory | 500MB (10×50MB) | ~10MB | **490MB** |
+| 20 DBs | Memory | 1GB (20×50MB) | ~10MB | **990MB** |
+
+**Usage:**
+```bash
+# Full comparison
+python bench/compare.py
+
+# Specific database counts
+python bench/compare.py --dbs 1,5,10
+
+# Only walsync (skip litestream)
+python bench/compare.py --walsync-only
+
+# Longer measurement (default: 5s)
+python bench/compare.py --duration 10
+
+# JSON output
+python bench/compare.py --json
+```
+
+**Requirements:**
+- `pip install psutil`
+- `brew install litestream` (optional, for comparison)
+
+### 3. Real-World Benchmarks (`realworld.py`)
+
+End-to-end performance metrics that users care about:
+
+#### a) Sync Latency
+Time from SQLite commit to S3 object appearing.
+
+Measures: p50, p95, p99, mean, max latency over N commits.
+
+#### b) Restore Performance
+Time to restore databases of various sizes from S3.
+
+Measures: download time, restore time, throughput (MB/s).
+
+#### c) Multi-DB Throughput
+Concurrent writes to N databases, measuring walsync's ability to keep up.
+
+Measures: writes/sec sustained, sync lag, CPU%, memory.
+
+#### d) Network Recovery
+Recovery time after simulated network outage.
+
+Measures: catchup time, writes lost (should be 0).
+
+**Usage:**
+```bash
+# Run all real-world benchmarks
+python bench/realworld.py
+
+# Run specific test
+python bench/realworld.py --test sync
+python bench/realworld.py --test restore
+python bench/realworld.py --test multi-db
+python bench/realworld.py --test network
+
+# JSON output
+python bench/realworld.py --json
+```
+
+**Requirements:**
+- `pip install psutil boto3`
+- Tigris/S3 credentials in environment
+- `WALSYNC_TEST_BUCKET` env var
+
+## Environment Setup
+
+```bash
+# Tigris credentials (from ourfam/.env or similar)
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
+export WALSYNC_TEST_BUCKET=s3://walsync-bench
+
+# Or use direnv/.envrc
+```
+
+## CI Integration
+
+Add to GitHub Actions:
+
+```yaml
+- name: Build release binary
+  run: cargo build --release
+
+- name: Run micro-benchmarks
+  run: cargo bench
+
+- name: Run real-world benchmarks
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    AWS_ENDPOINT_URL_S3: ${{ secrets.AWS_ENDPOINT_URL_S3 }}
+    WALSYNC_TEST_BUCKET: s3://walsync-bench
+  run: python bench/realworld.py --json > bench-results.json
+
+- name: Upload benchmark results
+  uses: actions/upload-artifact@v3
+  with:
+    name: benchmark-results
+    path: bench-results.json
+```
+
+## Interpreting Results
+
+**Sync latency:**
+- p50 < 100ms: Good
+- p95 < 500ms: Acceptable
+- p99 < 1s: Watch for network issues
+- Max > 5s: Check S3 endpoint
+
+**Restore:**
+- 10MB/s+: Good for Tigris
+- 50MB/s+: Good for S3 same-region
+- <5MB/s: Check network
+
+**Multi-DB:**
+- Memory ~10MB regardless of DB count: Good
+- CPU <20% for 10 DBs @ 100 writes/sec: Good
+- Sync lag p95 <1s: Good
+
+## Adding New Benchmarks
+
+1. Add to `realworld.py` as a new function
+2. Return a dataclass with results
+3. Add CLI flag if needed
+4. Update this README
+
+## Notes
+
+- Benchmarks require real S3/Tigris (no mocking)
+- Use dedicated test bucket to avoid prod data
+- Some benchmarks may incur S3 costs (minimal)
+- Network-dependent results may vary
