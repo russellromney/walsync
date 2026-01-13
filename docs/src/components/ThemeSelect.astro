@@ -1,0 +1,133 @@
+---
+/**
+ * Custom theme toggle with icon buttons instead of dropdown
+ */
+---
+
+<starlight-theme-select>
+  <div class="theme-toggle">
+    <button data-theme-value="light" aria-label="Light theme" title="Light">
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="5"></circle>
+        <line x1="12" y1="1" x2="12" y2="3"></line>
+        <line x1="12" y1="21" x2="12" y2="23"></line>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+        <line x1="1" y1="12" x2="3" y2="12"></line>
+        <line x1="21" y1="12" x2="23" y2="12"></line>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+      </svg>
+    </button>
+    <button data-theme-value="dark" aria-label="Dark theme" title="Dark">
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+      </svg>
+    </button>
+    <button data-theme-value="auto" aria-label="System theme" title="System">
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+        <line x1="8" y1="21" x2="16" y2="21"></line>
+        <line x1="12" y1="17" x2="12" y2="21"></line>
+      </svg>
+    </button>
+  </div>
+</starlight-theme-select>
+
+<style>
+  .theme-toggle {
+    display: flex;
+    gap: 0.125rem;
+    background: var(--sl-color-bg-nav);
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 2rem;
+    padding: 0.2rem;
+  }
+
+  button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--sl-color-gray-3);
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  button:hover {
+    color: var(--sl-color-text);
+    background: var(--sl-color-gray-6);
+  }
+
+  button[aria-pressed='true'] {
+    color: var(--sl-color-accent);
+    background: var(--sl-color-accent-low);
+  }
+</style>
+
+<script>
+  class ThemeToggle extends HTMLElement {
+    constructor() {
+      super();
+      this.buttons = this.querySelectorAll('button[data-theme-value]');
+      this.init();
+    }
+
+    init() {
+      // Get current theme
+      const currentTheme = this.getCurrentTheme();
+      this.updateButtons(currentTheme);
+
+      // Add click handlers
+      this.buttons.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const theme = btn.getAttribute('data-theme-value');
+          this.setTheme(theme);
+        });
+      });
+
+      // Watch for theme changes from other sources
+      const observer = new MutationObserver(() => {
+        this.updateButtons(this.getCurrentTheme());
+      });
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+    }
+
+    getCurrentTheme() {
+      // Check localStorage first
+      const stored = localStorage.getItem('starlight-theme');
+      if (stored) return stored;
+      // Fall back to system preference
+      return 'auto';
+    }
+
+    setTheme(theme: string) {
+      localStorage.setItem('starlight-theme', theme);
+
+      if (theme === 'auto') {
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+      } else {
+        document.documentElement.setAttribute('data-theme', theme);
+      }
+
+      this.updateButtons(theme);
+    }
+
+    updateButtons(currentTheme: string) {
+      this.buttons.forEach((btn) => {
+        const btnTheme = btn.getAttribute('data-theme-value');
+        btn.setAttribute('aria-pressed', btnTheme === currentTheme ? 'true' : 'false');
+      });
+    }
+  }
+
+  customElements.define('starlight-theme-select', ThemeToggle);
+</script>

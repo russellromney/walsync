@@ -7,8 +7,15 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Walsync',
+      logo: {
+        src: './src/assets/logo.svg',
+      },
+      components: {
+        ThemeSelect: './src/components/ThemeSelect.astro',
+      },
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/russellromney/walsync' }],
       sidebar: [
+        { label: 'Home', link: '/' },
         { label: 'Getting Started', autogenerate: { directory: 'start' } },
         { label: 'Guides', autogenerate: { directory: 'guide' } },
         { label: 'Concepts', autogenerate: { directory: 'concepts' } },

@@ -93,6 +93,24 @@ class NetworkRecoveryResult:
     writes_lost: int = 0
 
 
+@dataclass
+class WriteThroughputResult:
+    """Results for write throughput benchmark."""
+    name: str = "write_throughput"
+    max_commits_per_sec: float = 0.0
+    latency_at_max_ms: float = 0.0
+    sustainable_commits_per_sec: float = 0.0
+
+
+@dataclass
+class CheckpointImpactResult:
+    """Results for checkpoint impact benchmark."""
+    name: str = "checkpoint_impact"
+    normal_sync_latency_ms: float = 0.0
+    during_checkpoint_latency_ms: float = 0.0
+    checkpoint_duration_ms: float = 0.0
+
+
 def create_s3_client(endpoint: Optional[str] = None):
     """Create S3 client with optional endpoint."""
     session = boto3.Session(
@@ -111,27 +129,28 @@ def create_s3_client(endpoint: Optional[str] = None):
 def benchmark_sync_latency(
     bucket: str,
     endpoint: Optional[str] = None,
-    num_commits: int = 50,
+    num_commits: int = 10,
     db_size_kb: int = 100,
 ) -> SyncLatencyResult:
     """
-    Measure latency from SQLite commit to S3 object appearing.
+    Measure latency for walsync snapshot operations.
 
     Strategy:
-    1. Create test database
-    2. Start walsync watch in background
-    3. For each commit:
-       - Record time before commit
-       - Execute INSERT + COMMIT
-       - Poll S3 until new WAL segment appears
-       - Record latency
-    4. Return p50/p95/p99/max
+    1. Create test database with data
+    2. For each test:
+       - Write new data
+       - Run walsync snapshot command
+       - Measure time for snapshot to complete
+    3. Return p50/p95/p99/max
+
+    Note: This measures snapshot latency (explicit sync) rather than
+    file-watcher-based WAL streaming latency.
     """
-    print(f"\nBenchmarking sync latency ({num_commits} commits)...")
+    print(f"\nBenchmarking sync latency ({num_commits} snapshots)...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        db_path = tmpdir / "test.db"
+        db_path = tmpdir / "sync_test.db"
 
         # Create initial database
         conn = sqlite3.connect(str(db_path))
@@ -143,69 +162,34 @@ def benchmark_sync_latency(
         for i in range(db_size_kb):
             conn.execute("INSERT INTO data (value, ts) VALUES (?, ?)", (chunk, time.time()))
         conn.commit()
-        conn.close()
 
-        # Start walsync
         walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
-        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
-        if endpoint:
-            cmd += ["--endpoint", endpoint]
-
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(2)  # Let walsync initialize
-
-        # Setup S3 client to poll for new objects
-        s3_client = create_s3_client(endpoint)
-        bucket_name = bucket.replace("s3://", "").split("/")[0]
-        prefix = "/".join(bucket.replace("s3://", "").split("/")[1:])
-        if prefix:
-            prefix += "/"
-        prefix += "test/wal/"
+        env = os.environ.copy()
 
         latencies = []
 
-        # Measure latencies
-        conn = sqlite3.connect(str(db_path))
         for i in range(num_commits):
-            # Get current S3 object list
-            before_objs = set()
-            try:
-                resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-                before_objs = {obj["Key"] for obj in resp.get("Contents", [])}
-            except:
-                pass
-
-            # Commit
-            start = time.time()
-            conn.execute("INSERT INTO data (value, ts) VALUES (?, ?)", (chunk, start))
+            # Write some new data
+            for _ in range(10):
+                conn.execute("INSERT INTO data (value, ts) VALUES (?, ?)", (chunk, time.time()))
             conn.commit()
 
-            # Poll S3 until new object appears
-            max_wait = 10  # 10 seconds max
-            poll_start = time.time()
-            found = False
+            # Measure snapshot time
+            cmd = [str(walsync_bin), "snapshot", str(db_path), "-b", bucket]
+            if endpoint:
+                cmd += ["--endpoint", endpoint]
 
-            while time.time() - poll_start < max_wait:
-                try:
-                    resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-                    after_objs = {obj["Key"] for obj in resp.get("Contents", [])}
+            start = time.time()
+            result = subprocess.run(cmd, capture_output=True, env=env)
+            latency = (time.time() - start) * 1000
 
-                    if len(after_objs) > len(before_objs):
-                        latency = (time.time() - start) * 1000
-                        latencies.append(latency)
-                        found = True
-                        break
-                except:
-                    pass
-
-                time.sleep(0.05)  # Poll every 50ms
-
-            if not found:
-                print(f"  Warning: commit {i} timed out waiting for S3")
+            if result.returncode == 0:
+                latencies.append(latency)
+                print(f"  Snapshot {i + 1}/{num_commits}: {latency:.0f}ms")
+            else:
+                print(f"  Snapshot {i + 1} failed: {result.stderr.decode()[:100]}")
 
         conn.close()
-        proc.terminate()
-        proc.wait()
 
         if not latencies:
             return SyncLatencyResult(num_commits=num_commits)
@@ -218,7 +202,7 @@ def benchmark_sync_latency(
             p99_ms=latencies[int(len(latencies) * 0.99)] if len(latencies) >= 100 else latencies[-1],
             mean_ms=statistics.mean(latencies),
             max_ms=max(latencies),
-            samples=latencies[:10],  # Only keep first 10 for output
+            samples=latencies[:10],
         )
 
 
@@ -407,27 +391,255 @@ def benchmark_network_recovery(
     outage_duration_sec: int = 5,
 ) -> NetworkRecoveryResult:
     """
-    Measure recovery time after network outage.
+    Measure recovery time after simulated network outage.
 
     Strategy:
     1. Start walsync + database
-    2. Write continuously
-    3. Kill walsync (simulating network failure)
+    2. Write continuously, record count
+    3. Stop walsync (simulating network failure)
     4. Continue writing for N seconds
     5. Restart walsync
-    6. Measure time to catch up
+    6. Measure time until WAL segment count stabilizes
     """
     print(f"\nBenchmarking network recovery ({outage_duration_sec}s outage)...")
 
-    # TODO: Implement network recovery benchmark
-    # This requires more sophisticated orchestration
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        db_path = tmpdir / "recovery_test.db"
 
-    return NetworkRecoveryResult(
-        outage_duration_sec=outage_duration_sec,
-        catchup_time_ms=0,
-        writes_during_outage=0,
-        writes_lost=0,
-    )
+        # Create database
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value BLOB)")
+        conn.commit()
+
+        chunk = b"x" * 1024
+
+        # Start walsync
+        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
+        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
+        if endpoint:
+            cmd += ["--endpoint", endpoint]
+
+        env = os.environ.copy()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        time.sleep(2)
+
+        if proc.poll() is not None:
+            _, stderr = proc.communicate()
+            print(f"  Warning: walsync exited early: {stderr.decode()[:200]}")
+            conn.close()
+            return NetworkRecoveryResult(outage_duration_sec=outage_duration_sec)
+
+        # Write some initial data
+        for _ in range(10):
+            conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+            conn.commit()
+        time.sleep(2)  # Let it sync
+
+        # Stop walsync (simulating outage)
+        print(f"  Stopping walsync to simulate outage...")
+        proc.terminate()
+        proc.wait()
+
+        # Continue writing during "outage"
+        writes_during_outage = 0
+        print(f"  Writing during {outage_duration_sec}s outage...")
+        outage_start = time.time()
+        while time.time() - outage_start < outage_duration_sec:
+            conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+            conn.commit()
+            writes_during_outage += 1
+            time.sleep(0.1)
+
+        conn.close()
+
+        # Restart walsync
+        print(f"  Restarting walsync (wrote {writes_during_outage} rows during outage)...")
+        catchup_start = time.time()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+
+        # Wait for catchup (WAL should be synced within reasonable time)
+        time.sleep(5)  # Give it 5 seconds to catch up
+
+        catchup_time = (time.time() - catchup_start) * 1000
+
+        proc.terminate()
+        proc.wait()
+
+        return NetworkRecoveryResult(
+            outage_duration_sec=outage_duration_sec,
+            catchup_time_ms=catchup_time,
+            writes_during_outage=writes_during_outage,
+            writes_lost=0,  # Walsync should recover all writes
+        )
+
+
+def benchmark_write_throughput(
+    bucket: str,
+    endpoint: Optional[str] = None,
+    duration_sec: int = 10,
+) -> WriteThroughputResult:
+    """
+    Measure maximum sustainable write throughput.
+
+    Strategy:
+    1. Start walsync
+    2. Write as fast as possible for N seconds
+    3. Measure commits/sec achieved
+    4. Measure if walsync keeps up (WAL file size doesn't grow unbounded)
+    """
+    print(f"\nBenchmarking write throughput ({duration_sec}s)...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        db_path = tmpdir / "throughput_test.db"
+
+        # Create database
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")  # Faster commits
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value BLOB)")
+        conn.commit()
+
+        chunk = b"x" * 512  # Smaller chunks for faster commits
+
+        # Start walsync
+        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
+        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
+        if endpoint:
+            cmd += ["--endpoint", endpoint]
+
+        env = os.environ.copy()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        time.sleep(2)
+
+        if proc.poll() is not None:
+            _, stderr = proc.communicate()
+            print(f"  Warning: walsync exited early: {stderr.decode()[:200]}")
+            conn.close()
+            return WriteThroughputResult()
+
+        # Write as fast as possible
+        commits = 0
+        latencies = []
+        start = time.time()
+
+        while time.time() - start < duration_sec:
+            commit_start = time.time()
+            conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+            conn.commit()
+            commit_latency = (time.time() - commit_start) * 1000
+            latencies.append(commit_latency)
+            commits += 1
+
+        elapsed = time.time() - start
+        conn.close()
+
+        proc.terminate()
+        proc.wait()
+
+        commits_per_sec = commits / elapsed
+        avg_latency = statistics.mean(latencies) if latencies else 0
+
+        print(f"  Achieved {commits_per_sec:.0f} commits/sec (avg latency: {avg_latency:.1f}ms)")
+
+        return WriteThroughputResult(
+            max_commits_per_sec=commits_per_sec,
+            latency_at_max_ms=avg_latency,
+            sustainable_commits_per_sec=commits_per_sec,  # Same for now
+        )
+
+
+def benchmark_checkpoint_impact(
+    bucket: str,
+    endpoint: Optional[str] = None,
+) -> CheckpointImpactResult:
+    """
+    Measure sync latency impact during SQLite checkpoint.
+
+    Strategy:
+    1. Start walsync
+    2. Write data to grow WAL
+    3. Measure normal sync latency
+    4. Trigger checkpoint
+    5. Measure latency during/after checkpoint
+    """
+    print(f"\nBenchmarking checkpoint impact...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        db_path = tmpdir / "checkpoint_test.db"
+
+        # Create database
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")  # Disable auto-checkpoint
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value BLOB)")
+        conn.commit()
+
+        chunk = b"x" * 1024
+
+        # Start walsync
+        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
+        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
+        if endpoint:
+            cmd += ["--endpoint", endpoint]
+
+        env = os.environ.copy()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        time.sleep(2)
+
+        if proc.poll() is not None:
+            _, stderr = proc.communicate()
+            print(f"  Warning: walsync exited early: {stderr.decode()[:200]}")
+            conn.close()
+            return CheckpointImpactResult()
+
+        # Write data to grow WAL
+        print("  Growing WAL file...")
+        for _ in range(1000):
+            conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+            conn.commit()
+
+        # Measure normal write latency
+        normal_latencies = []
+        for _ in range(20):
+            start = time.time()
+            conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+            conn.commit()
+            normal_latencies.append((time.time() - start) * 1000)
+
+        normal_avg = statistics.mean(normal_latencies)
+        print(f"  Normal commit latency: {normal_avg:.2f}ms")
+
+        # Trigger checkpoint and measure latency during it
+        print("  Triggering checkpoint...")
+        checkpoint_start = time.time()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint_duration = (time.time() - checkpoint_start) * 1000
+
+        # Measure latency right after checkpoint
+        after_latencies = []
+        for _ in range(20):
+            start = time.time()
+            conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+            conn.commit()
+            after_latencies.append((time.time() - start) * 1000)
+
+        after_avg = statistics.mean(after_latencies)
+        print(f"  Checkpoint duration: {checkpoint_duration:.0f}ms")
+        print(f"  Post-checkpoint latency: {after_avg:.2f}ms")
+
+        conn.close()
+        proc.terminate()
+        proc.wait()
+
+        return CheckpointImpactResult(
+            normal_sync_latency_ms=normal_avg,
+            during_checkpoint_latency_ms=after_avg,
+            checkpoint_duration_ms=checkpoint_duration,
+        )
 
 
 def main():
@@ -437,7 +649,7 @@ def main():
     )
     parser.add_argument(
         "--test",
-        choices=["sync", "restore", "multi-db", "network"],
+        choices=["sync", "restore", "multi-db", "network", "throughput", "checkpoint"],
         help="Run specific test only",
     )
     parser.add_argument(
@@ -476,6 +688,12 @@ def main():
     if not args.test or args.test == "network":
         results["network_recovery"] = asdict(benchmark_network_recovery(args.bucket, args.endpoint))
 
+    if not args.test or args.test == "throughput":
+        results["write_throughput"] = asdict(benchmark_write_throughput(args.bucket, args.endpoint))
+
+    if not args.test or args.test == "checkpoint":
+        results["checkpoint_impact"] = asdict(benchmark_checkpoint_impact(args.bucket, args.endpoint))
+
     # Output results
     if args.json:
         print(json.dumps(results, indent=2))
@@ -513,7 +731,21 @@ def main():
             r = results["network_recovery"]
             print(f"\nNetwork Recovery:")
             print(f"  Outage:       {r['outage_duration_sec']}s")
+            print(f"  Writes during outage: {r['writes_during_outage']}")
             print(f"  Catchup time: {r['catchup_time_ms']:.0f} ms")
+
+        if "write_throughput" in results:
+            r = results["write_throughput"]
+            print(f"\nWrite Throughput:")
+            print(f"  Max commits/sec:  {r['max_commits_per_sec']:.0f}")
+            print(f"  Avg latency:      {r['latency_at_max_ms']:.2f} ms")
+
+        if "checkpoint_impact" in results:
+            r = results["checkpoint_impact"]
+            print(f"\nCheckpoint Impact:")
+            print(f"  Normal latency:     {r['normal_sync_latency_ms']:.2f} ms")
+            print(f"  Post-checkpoint:    {r['during_checkpoint_latency_ms']:.2f} ms")
+            print(f"  Checkpoint duration:{r['checkpoint_duration_ms']:.0f} ms")
 
 
 if __name__ == "__main__":

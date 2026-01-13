@@ -33,9 +33,10 @@ Memory and CPU usage comparison between walsync and litestream:
 
 | Scenario | Metric | Litestream | Walsync | Savings |
 |----------|--------|------------|---------|---------|
-| 5 DBs | Memory | 250MB (5×50MB) | ~10MB | **240MB** |
-| 10 DBs | Memory | 500MB (10×50MB) | ~10MB | **490MB** |
-| 20 DBs | Memory | 1GB (20×50MB) | ~10MB | **990MB** |
+| 1 DB | Memory | 33MB | 12MB | **21MB** |
+| 5 DBs | Memory | 152MB (5 processes) | 14MB | **138MB** |
+| 10 DBs | Memory | 286MB (10 processes) | 12MB | **274MB** |
+| 20 DBs | Memory | 600MB (20 processes) | 12MB | **588MB** |
 
 **Usage:**
 ```bash
@@ -56,7 +57,7 @@ python bench/compare.py --json
 ```
 
 **Requirements:**
-- `pip install psutil`
+- `uv pip install psutil`
 - `brew install litestream` (optional, for comparison)
 
 ### 3. Real-World Benchmarks (`realworld.py`)
@@ -83,6 +84,16 @@ Recovery time after simulated network outage.
 
 Measures: catchup time, writes lost (should be 0).
 
+#### e) Write Throughput
+Maximum sustainable commits per second with walsync watching.
+
+Measures: max commits/sec, average latency.
+
+#### f) Checkpoint Impact
+Impact of SQLite checkpoints on sync latency.
+
+Measures: normal latency, post-checkpoint latency, checkpoint duration.
+
 **Usage:**
 ```bash
 # Run all real-world benchmarks
@@ -93,13 +104,15 @@ python bench/realworld.py --test sync
 python bench/realworld.py --test restore
 python bench/realworld.py --test multi-db
 python bench/realworld.py --test network
+python bench/realworld.py --test throughput
+python bench/realworld.py --test checkpoint
 
 # JSON output
 python bench/realworld.py --json
 ```
 
 **Requirements:**
-- `pip install psutil boto3`
+- `uv pip install psutil boto3`
 - Tigris/S3 credentials in environment
 - `WALSYNC_TEST_BUCKET` env var
 

@@ -38,6 +38,11 @@ except ImportError:
     print("Please install psutil: pip install psutil")
     sys.exit(1)
 
+try:
+    import boto3
+except ImportError:
+    boto3 = None  # Cleanup will be skipped
+
 
 @dataclass
 class BenchmarkResult:
@@ -280,6 +285,28 @@ def run_comparison(
     return results
 
 
+def cleanup_s3_prefix(bucket: str, prefix: str, endpoint: Optional[str] = None) -> None:
+    """Clean up test objects from S3."""
+    try:
+        session = boto3.Session()
+        config_kwargs = {}
+        if endpoint:
+            config_kwargs["endpoint_url"] = endpoint
+
+        s3 = session.client("s3", **config_kwargs)
+        bucket_name = bucket.replace("s3://", "").split("/")[0]
+
+        # List and delete objects with prefix
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+            if "Contents" in page:
+                objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
+                if objects:
+                    s3.delete_objects(Bucket=bucket_name, Delete={"Objects": objects})
+    except Exception as e:
+        print(f"Warning: Failed to cleanup S3: {e}")
+
+
 def print_summary(results: list[dict]) -> None:
     """Print a summary table of all results."""
     if not results or "walsync" not in results[0] or "litestream" not in results[0]:
@@ -390,6 +417,12 @@ Examples:
         print(json.dumps(results, indent=2))
     else:
         print_summary(results)
+
+    # Cleanup test objects from S3
+    if boto3 and not args.json:
+        print("\nCleaning up S3 test data...")
+        cleanup_s3_prefix(args.bucket, "test_", args.endpoint)
+        print("Done.")
 
 
 if __name__ == "__main__":

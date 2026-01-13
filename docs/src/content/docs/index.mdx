@@ -1,16 +1,9 @@
 ---
 title: Walsync
-description: Lightweight SQLite WAL sync to S3 with data integrity verification
+description: Lightweight SQLite WAL sync to S3 in Rust
 ---
 
-# Walsync
-
-Lightweight SQLite WAL sync to S3 with cryptographic integrity verification.
-
-- **Data Integrity**: SHA256 checksums on every snapshot
-- **Multi-Database**: One process syncs unlimited databases
-- **Lightweight**: ~7MB binary, ~10MB RAM
-- **S3 Compatible**: AWS S3, Tigris, MinIO, R2
+Lightweight SQLite WAL sync to S3 in Rust. Sync multiple databases with one process. Super fast sync, snapshot, and replay.
 
 ## Quick Install
 

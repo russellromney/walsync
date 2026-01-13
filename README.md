@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Walsync" width="200">
+</p>
+
 # walsync
 
 **Lightweight SQLite WAL sync to S3/Tigris with explicit data integrity verification.**
@@ -7,7 +11,7 @@ Like Litestream but:
 - ✅ **Production-grade data integrity** - Byte-for-byte database reconstruction guaranteed
 - ✅ **Multi-database efficiency** - Single process handles N databases (vs N Litestream processes)
 - ✅ **~7MB binary** - Rust vs Go runtime overhead
-- ✅ **Minimal memory** - ~5-10MB RSS for 5+ databases
+- ✅ **Minimal memory** - ~12MB RSS regardless of database count
 
 ## Installation
 
@@ -155,11 +159,12 @@ See [DATA_INTEGRITY.md](DATA_INTEGRITY.md) for complete testing details.
 
 | Databases | Litestream | Walsync | Savings |
 |-----------|-----------|---------|---------|
-| 5 | 158 MB (5 processes) | ~1 MB (1 process) | **157 MB** |
-| 10 | 327 MB (10 processes) | ~1 MB (1 process) | **326 MB** |
-| 20 | 685 MB (20 processes) | ~3 MB (1 process) | **682 MB** |
+| 1 | 33 MB (1 process) | 12 MB (1 process) | **21 MB** |
+| 5 | 152 MB (5 processes) | 14 MB (1 process) | **138 MB** |
+| 10 | 286 MB (10 processes) | 12 MB (1 process) | **274 MB** |
+| 20 | 600 MB (20 processes) | 12 MB (1 process) | **588 MB** |
 
-*Measured on macOS. See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full results.*
+*Measured on macOS with 100KB test databases. See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full results.*
 
 Single walsync process handles multiple databases with shared S3 connection pooling.
 
@@ -188,7 +193,7 @@ walsync watch \
   --endpoint https://fly.storage.tigris.dev
 ```
 
-All databases sync with single process, saving 200MB+ memory vs Litestream.
+All databases sync with single process, saving ~275MB memory vs Litestream for 10 databases.
 
 ## Documentation
 

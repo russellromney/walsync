@@ -48,6 +48,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 
+# LTX format (Litestream-compatible)
+litetx = "0.1"
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"

@@ -4,3 +4,34 @@
   --sl-color-accent: #ce422b;
   --sl-color-accent-high: #f8d4cc;
 }
+
+/* Warm rusty-white background for light mode */
+:root[data-theme='light'] {
+  --sl-color-bg: #f8f0e8;
+  --sl-color-bg-nav: #f2e8dc;
+  --sl-color-bg-sidebar: #f2e8dc;
+  --sl-color-bg-inline-code: #ece0d2;
+  --sl-color-hairline-light: #e2d4c4;
+  --sl-color-hairline: #d4c4b0;
+}
+
+/* Slightly warmer dark mode too */
+:root[data-theme='dark'] {
+  --sl-color-bg: #1a1614;
+  --sl-color-bg-nav: #211d1a;
+  --sl-color-bg-sidebar: #211d1a;
+}
+
+/* Right sidebar (table of contents) matches left sidebar */
+.right-sidebar {
+  background: var(--sl-color-bg-sidebar);
+}
+
+.right-sidebar-panel {
+  background: var(--sl-color-bg-sidebar);
+}
+
+/* Ensure the TOC container has the sidebar background */
+starlight-toc {
+  background: var(--sl-color-bg-sidebar);
+}
