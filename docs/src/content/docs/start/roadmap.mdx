@@ -1,0 +1,61 @@
+---
+title: Roadmap
+description: Planned features and future direction
+---
+
+## Current (v0.2)
+
+- ✅ WAL sync to S3/Tigris
+- ✅ SHA256 checksums in S3 metadata
+- ✅ Multi-database support (single process)
+- ✅ Snapshot scheduling
+- ✅ Point-in-time restore
+- ✅ Python bindings
+
+## Planned
+
+### WAL Replay on Restore
+
+Currently restore only downloads the latest snapshot. Full point-in-time recovery requires replaying WAL segments after the snapshot.
+
+### Leader-Follower Replication
+
+Low-latency real-time replication mode for read replicas.
+
+**Why:** S3 polling/events adds seconds of latency. Direct streaming enables sub-100ms replication.
+
+**Approach:**
+- Leader streams WAL frames over TCP to connected followers
+- Followers apply frames to local SQLite copy
+- Separate from backup mode (different use case)
+
+```
+walsync replicate --leader app.db --port 5432
+walsync replicate --follower leader.host:5432 --output replica.db
+```
+
+**Open questions:**
+- Protocol: raw TCP vs WebSocket vs QUIC?
+- Discovery: static config vs mDNS vs control plane?
+- Consistency: async replication or synchronous commit?
+
+### Documentation
+
+- **Litestream acknowledgment** - Credit Litestream, explain when to use it vs walsync
+- **Performance benchmarks** - Memory, CPU, latency comparisons across scenarios
+
+## Not Planned
+
+Walsync is intentionally simple. These features are out of scope:
+
+- **Compression** - Use SQLite extensions (sqlite-zstd); WAL inherits it automatically
+- **Encryption** - Use SQLCipher or SQLite SEE; WAL inherits it automatically
+- **Compaction** - WAL segments stay as-is; use S3 lifecycle rules for cleanup
+- **LTX format** - No custom binary format like Litestream; raw WAL is debuggable
+- **Retention policies** - Use S3 lifecycle rules
+- **GUI/web interface** - CLI-first tool for developers
+- **Restore UI** - Just `walsync restore`, no wizards
+
+---
+
+Have a feature request? [Open an issue](https://github.com/russellromney/walsync/issues).

@@ -1,39 +1,102 @@
-# Build artifacts
+# Rust
 /target/
 *.o
 *.a
 *.so
 *.dylib
 *.dll
-
-# Cargo
 Cargo.lock
 *.rlib
+.cargo/
+.rustup/
+rust-toolchain.lock
+
+# Node & Package Managers
+node_modules/
+docs/node_modules/
+*.npm
+.npm
+.pnpm-debug.log*
+lerna-debug.log*
+package-lock.json
+npm-debug.log
+yarn-error.log
+pnpm-lock.yaml
+
+# Bun
+.bun/
+bun.lockb
 
 # Environment files
 .env
 .env.local
 .env.*.local
+.env.production.local
+.env.development.local
+.env.test.local
 
-# IDE
+# IDE & Editor
 .idea/
 .vscode/
+.vscode/settings.json
+.vscode/launch.json
 *.swp
 *.swo
 *.iml
-.vscode/settings.json
+*.code-workspace
+.sublime-workspace
+.sublime-project
 
 # OS
 .DS_Store
 Thumbs.db
 .AppleDouble
 .LSOverride
+.TemporaryItems
+.Trashes
+ehthumbs.db
+desktop.ini
 
-# Test files (created in /tmp but explicit for safety)
+# Build & Dist
+/build/
+/dist/
+/docs/dist/
+/docs/.astro/
+/docs/.next/
+/docs/.nuxt/
+/out/
+
+# Test & Coverage
+/coverage/
+.nyc_output
+*.lcov
+junit.xml
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.~*
+*.swp
+*.swo
+
+# Generated files
+docs/src/env.d.ts
+dist/
+.turbo/
+*.tsbuildinfo
+
+# Test database files
 /tmp/walsync-test-*.db
 /tmp/restored-*.db
 
-# Rust
-.cargo/
-.rustup/
-rust-toolchain.lock
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Development/Build artifacts
+benches/
+.astro/

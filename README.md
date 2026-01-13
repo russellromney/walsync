@@ -190,7 +190,7 @@ All databases sync with single process, saving 200MB+ memory vs Litestream.
 
 ## Documentation
 
-- [ROADMAP.md](docs/ROADMAP.md) - Planned features and direction
+- [ROADMAP.md](ROADMAP.md) - Planned features and direction
 - [CHECKSUM_STRATEGY.md](CHECKSUM_STRATEGY.md) - SHA256 implementation strategy
 - [DATA_INTEGRITY.md](DATA_INTEGRITY.md) - Data integrity guarantees and testing
 - [TESTING.md](TESTING.md) - Comprehensive testing guide

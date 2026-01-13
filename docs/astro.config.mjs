@@ -11,45 +11,8 @@ export default defineConfig({
         alt: 'Walsync',
       },
       favicon: './public/favicon.svg',
-      social: {
-        github: 'https://github.com/russellromney/walsync',
-      },
-      sidebar: [
-        {
-          label: 'Start',
-          items: [
-            { label: 'Why Walsync?', slug: 'start/why' },
-            { label: 'Installation', slug: 'start/install' },
-            { label: 'Quick Start', slug: 'start/quickstart' },
-          ],
-        },
-        {
-          label: 'Guide',
-          items: [
-            { label: 'CLI Commands', slug: 'guide/cli' },
-            { label: 'Python API', slug: 'guide/python' },
-            { label: 'Configuration', slug: 'guide/config' },
-            { label: 'S3 Layout', slug: 'guide/s3-layout' },
-          ],
-        },
-        {
-          label: 'Deep Dive',
-          items: [
-            { label: 'Data Integrity', slug: 'concepts/integrity' },
-            { label: 'Multi-Database', slug: 'concepts/multi-db' },
-            { label: 'Performance', slug: 'concepts/performance' },
-            { label: 'Architecture', slug: 'concepts/architecture' },
-          ],
-        },
-        {
-          label: 'Reference',
-          items: [
-            { label: 'CLI Reference', slug: 'reference/cli' },
-            { label: 'Python API', slug: 'reference/python-api' },
-            { label: 'Environment Variables', slug: 'reference/env' },
-            { label: 'Troubleshooting', slug: 'reference/troubleshooting' },
-          ],
-        },
+      social: [
+        { label: 'GitHub', href: 'https://github.com/russellromney/walsync', icon: 'github' },
       ],
       // Disable dark mode - clean simple design
       customCss: ['./src/styles/custom.css'],

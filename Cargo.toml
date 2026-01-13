@@ -50,6 +50,12 @@ sha2 = "0.10"
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+brunch = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "benchmarks"
+harness = false
 
 [profile.release]
 opt-level = "z"
