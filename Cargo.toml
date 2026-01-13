@@ -1,10 +1,14 @@
 [package]
 name = "walsync"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
+authors = ["Russell Romney <russellromney@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/russellromney/walsync"
+homepage = "https://github.com/russellromney/walsync"
+keywords = ["sqlite", "wal", "s3", "backup", "sync"]
+categories = ["database", "command-line-utilities"]
 
 [lib]
 name = "walsync"
